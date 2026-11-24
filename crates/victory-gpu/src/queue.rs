@@ -119,11 +119,29 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        let mut skipped = 0;
         let host_lists: Vec<_> = lists
             .iter()
+            .filter(|&&l| {
+                let may = crate::list::may_run(l);
+                skipped += usize::from(!may);
+                may
+            })
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
+        if skipped > 0 {
+            static LOST: AtomicBool = AtomicBool::new(false);
+            if !LOST.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    skipped,
+                    "lists submitted again after their dynamic descriptor slots were taken back are not run"
+                );
+            }
+        }
         host.execute(&host_lists);
+        for &l in lists {
+            crate::list::finished(l);
+        }
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
@@ -163,9 +181,48 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     }
     crate::fence::signal(fence, value)
 }
-/// Nothing runs on the queue, so waiting for a fence never blocks it.
-extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+/// Upstream: nothing runs on the queue, so waiting for a fence never blocks
+/// it. local: our submissions run when the title submits them, so a queue
+/// told to wait for a fence another thread's queue signals later would run
+/// its next lists before the work they depend on (reading data never
+/// written). The calling thread now blocks until the fence is reached, at
+/// most `VICTORY_QUEUE_WAIT_MS` (default 2000; 0 restores upstream).
+extern "system" fn wait(_: This, fence: This, value: u64) -> HRESULT {
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_QUEUE_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2000)
+    });
+    static ALREADY: AtomicU64 = AtomicU64::new(0);
+    static BLOCKED: AtomicU64 = AtomicU64::new(0);
+    static TIMED_OUT: AtomicU64 = AtomicU64::new(0);
+    if crate::fence::reached(fence, value) {
+        ALREADY.fetch_add(1, Ordering::Relaxed);
+        return S_OK;
+    }
+    if limit == 0 {
+        return S_OK;
+    }
+    let started = std::time::Instant::now();
+    let ok = crate::fence::block_until(fence, value, std::time::Duration::from_millis(limit));
+    let blocked = BLOCKED.fetch_add(1, Ordering::Relaxed) + 1;
+    if !ok {
+        let n = TIMED_OUT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 20 || n % 100 == 0 {
+            tracing::warn!(value, timed_out = n, "queue wait: fence not reached in time; running on");
+        }
+    } else if blocked <= 20 || blocked % 500 == 0 {
+        tracing::info!(
+            value,
+            ms = started.elapsed().as_secs_f64() * 1000.0,
+            blocked,
+            already = ALREADY.load(Ordering::Relaxed),
+            "queue wait: blocked until another queue signalled"
+        );
+    }
+    S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
@@ -227,7 +284,6 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -272,8 +328,25 @@ extern "system" fn present(
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = crate::draw::drawn() + crate::draw::dispatched();
+        crate::capture::note_busy(frame, now - LAST.swap(now, Ordering::Relaxed));
+    }
+    // Show mode (diagnostics builds) picks its target before a dump takes
+    // the frame's list.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let shown = crate::capture::shown(frame);
+    #[cfg(all(windows, feature = "diagnostics"))]
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
+    }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let (Some(copy), Some(host)) = (&shown, crate::host::host()) {
+        let state = crate::host::legal_state(&copy.texture, copy.state.load(Ordering::Relaxed));
+        if host.present(&copy.texture, state, frame).is_some() {
+            return S_OK;
+        }
     }
     #[cfg(windows)]
     if planes > 0
@@ -439,7 +512,7 @@ const METHODS: [(usize, *const ()); 15] = [
 /// Newer titles' queues have two more methods before Signal, which moved
 /// from 0x70 to 0x80: every slot from 0x70 on is two later (taken here as
 /// starting exactly at 0x70, the methods before it kept in place).
-/// Inferred from Grand Theft Auto VI's calls: Signal 0x80 `(fence,
+/// Inferred from a title's calls: Signal 0x80 `(fence,
 /// value)`, timestamp frequency 0x90 (title+0x24841a6), suspend and resume
 /// 0xb8/0xc0, PresentX 0x100, the frame-token submission 0x118 `(count,
 /// lists, token, flags)` (title+0x24821dd).
@@ -507,7 +580,7 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 
-    /// Grand Theft Auto VI's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.
+    /// a title's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.
     #[test]
     fn console_queues_are_created_as_on_pc() {
         let null = std::ptr::null();

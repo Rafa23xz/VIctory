@@ -107,7 +107,39 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
         }
         !reached
     });
+    drop(waiters);
+    let (lock, cv) = &SIGNALED;
+    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    cv.notify_all();
     S_OK
+}
+
+/// local: notified on every signal, for queue waits.
+static SIGNALED: (Mutex<()>, std::sync::Condvar) = (Mutex::new(()), std::sync::Condvar::new());
+
+/// local: whether `this` has reached `value`.
+pub(crate) fn reached(this: This, value: u64) -> bool {
+    fence(this).value.load(Ordering::Acquire) >= value
+}
+
+/// local: blocks the calling thread until `this` reaches `value` or
+/// `timeout` passes (values written straight to the fence's address are
+/// seen by polling every millisecond). True if reached.
+pub(crate) fn block_until(this: This, value: u64, timeout: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    let (lock, cv) = &SIGNALED;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if reached(this, value) {
+            return true;
+        }
+        let left = timeout.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return false;
+        }
+        let slice = left.min(std::time::Duration::from_millis(1));
+        held = cv.wait_timeout(held, slice).unwrap_or_else(|e| e.into_inner()).0;
+    }
 }
 
 extern "system" fn creation_flags(this: This) -> u32 {

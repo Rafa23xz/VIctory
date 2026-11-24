@@ -181,6 +181,27 @@ pub(crate) fn bound(
     true
 }
 
+/// local: the count buffer of a counted execution, when it is not the
+/// arguments' buffer, moved to the indirect-argument state D3D12 requires
+/// of it too (left in unordered access, the execution is an invalid call
+/// that removes the device: the instance culling's counted mesh
+/// dispatches did, `INVALID_CALL` within seconds of the world). The title's
+/// passes wrote it; the transition also orders those writes first.
+pub(crate) fn count_ready(list: &HostList, count: &ID3D12Resource, arguments: &ID3D12Resource) -> bool {
+    if count == arguments {
+        return false;
+    }
+    // SAFETY: an open list and a live buffer the caller's list holds.
+    unsafe {
+        list.list.ResourceBarrier(&[transition(
+            count,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )])
+    };
+    true
+}
+
 /// After the execution: the buffer back to unordered access, where the
 /// title's passes keep using it.
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {

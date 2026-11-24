@@ -116,12 +116,30 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                        // Diagnostics: `VICTORY_DUMP_FAILED=<dir>` keeps the
+                        // container, for `victory shader-info --disasm`.
+                        if let Some(dir) = std::env::var_os("VICTORY_DUMP_FAILED") {
+                            let path = std::path::Path::new(&dir)
+                                .join(format!("{}-{}.dxbc", self.stage, self.hash));
+                            let _ = std::fs::write(path, &self.container);
+                        }
+                    }
+                }
+                // local: `VICTORY_DUMP_SHADERS=dir` keeps the containers
+                // (all of them with `VICTORY_DUMP_ALL=1`, else the ones that
+                // do not translate), for offline study.
+                if let Some(dir) = std::env::var_os("VICTORY_DUMP_SHADERS")
+                    && (done.is_err() || std::env::var_os("VICTORY_DUMP_ALL").is_some())
+                {
+                    let file = std::path::Path::new(&dir).join(format!("{}.dxbc", self.hash));
+                    let _ = std::fs::write(file, &self.container);
                 }
                 done.ok()
             })
@@ -129,10 +147,76 @@ impl Shader {
     }
 }
 
+/// local: the host signs translated DXIL with its own hash, so nothing on
+/// the way to the driver checks it. A program the validator refuses for
+/// what it does (an operation the stage may not perform, bad control
+/// flow, ...) is undefined behavior on the driver: refuse it, as a shader
+/// that does not translate, with the validator's words. Refusals that are
+/// only about the container's feature flags (`Flags must match usage`)
+/// are logged and let through: those programs ran before and their code
+/// is well formed. `VICTORY_VALIDATE_DXIL=0` turns this off, `warn` only
+/// logs. Without dxil.dll, nothing is checked (said once).
+#[cfg(windows)]
+fn validate_host_dxil(dxil: &[u8]) -> Result<(), String> {
+    use victory_shader::emit::validator::Validator;
+    #[derive(PartialEq)]
+    enum Mode {
+        Off,
+        Warn,
+        Refuse,
+    }
+    static MODE: OnceLock<Mode> = OnceLock::new();
+    let mode = MODE.get_or_init(|| match std::env::var("VICTORY_VALIDATE_DXIL").as_deref().map(str::trim) {
+        Ok("0") | Ok("off") => Mode::Off,
+        Ok("warn") => Mode::Warn,
+        _ => Mode::Refuse,
+    });
+    if *mode == Mode::Off {
+        return Ok(());
+    }
+    thread_local! {
+        static VALIDATOR: std::cell::RefCell<Option<Validator>> = std::cell::RefCell::new(
+            match Validator::load(Validator::default_path().as_deref()) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| tracing::warn!(error = %e, "no DXIL validator: translated shaders are not checked"));
+                    None
+                }
+            },
+        );
+    }
+    let refused = VALIDATOR.with(|v| {
+        let mut v = v.borrow_mut();
+        let v = v.as_mut()?;
+        // The validator signs in place: check a copy, keep ours.
+        v.validate(&mut dxil.to_vec()).err()
+    });
+    let Some(text) = refused else {
+        return Ok(());
+    };
+    let errors: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("error:") && !l.contains("Validation failed"))
+        .collect();
+    let flags_only = !errors.is_empty() && errors.iter().all(|l| l.contains("Flags must match usage"));
+    let summary: String = errors.join(" | ").chars().take(600).collect();
+    if flags_only || *mode == Mode::Warn {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
+            tracing::warn!(errors = %summary, "the DXIL validator refuses a translated shader; it runs anyway");
+        }
+        return Ok(());
+    }
+    Err(format!("the DXIL validator refuses the translation: {summary}"))
+}
+
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let host = crate::shader_cache::host_shader(container)?;
+    validate_host_dxil(&host.dxil)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let used = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)
@@ -149,6 +233,29 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => Vec::new(),
     };
     Ok(Translated { host, used })
+}
+
+/// Diagnostics: the console resources each stage of pipeline `this` uses
+/// (stage, shader hash, resources), whether or not its shaders translate.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn native_used(this: This) -> Vec<(&'static str, String, Vec<victory_shader::UsedResource>)> {
+    use victory_shader::{Container, FourCC};
+    if this.is_null() {
+        return Vec::new();
+    }
+    pipeline(this)
+        .shaders
+        .iter()
+        .map(|s| {
+            let used = Container::parse(&s.container)
+                .ok()
+                .and_then(|c| c.part(FourCC::DXIL).map(|p| p.data.to_vec()))
+                .and_then(|d| victory_shader::native_programs(&d).ok())
+                .map(|programs| programs.into_iter().flat_map(|p| p.used).collect())
+                .unwrap_or_default();
+            (s.stage, s.hash.clone(), used)
+        })
+        .collect()
 }
 
 #[repr(C)]
@@ -240,6 +347,20 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
     });
+    // local: VICTORY_SKIP_STAGES=mesh[,compute,...] skips every pipeline
+    // with a shader of those stages.
+    static STAGES: OnceLock<Vec<String>> = OnceLock::new();
+    let stages = STAGES.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_STAGES")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    if let Some(shader) = p.shaders.iter().find(|s| stages.iter().any(|st| st == &s.stage.to_ascii_lowercase())) {
+        return Some(shader.hash.as_str());
+    }
     if hashes.is_empty() {
         return None;
     }

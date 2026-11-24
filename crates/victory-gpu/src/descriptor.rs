@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+pub(crate) mod lease;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -73,7 +75,7 @@ impl Heap {
     }
 
     /// The host heap, made on first use from what the title wrote so far.
-    /// Made late because a host view heap the size of Grand Theft Auto VI's
+    /// Made late because a host view heap the size of a title's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
@@ -231,7 +233,9 @@ impl RtvRecord {
                 0,
             ]
         };
-        words[0] = crate::resource::pc_format(words[0]);
+        // Render target and depth views: a packed 16-bit target may be
+        // R8G8B8A8_UNORM on this GPU (`resource::target_format`).
+        words[0] = crate::resource::target_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }
@@ -396,11 +400,38 @@ pub(crate) fn forget(resource: usize) {
             continue;
         }
         views.index.remove(&view);
+        #[cfg(all(windows, feature = "diagnostics"))]
+        retire(i, generation, &view, resource);
         views.list[i as usize].1 = generation.wrapping_add(1).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
     }
+}
+
+/// local (diagnostics): what released views of entries viewed, so a null
+/// slot a draw reads can say what the title still points at (bounded).
+#[cfg(all(windows, feature = "diagnostics"))]
+static RETIRED: std::sync::Mutex<Option<std::collections::HashMap<(u32, u32), String>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn retire(i: u32, generation: u32, view: &View, resource: usize) {
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let map = retired.get_or_insert_with(Default::default);
+    if map.len() >= 1 << 20 {
+        return;
+    }
+    let bytes = crate::resource::buffer_bytes(resource as This);
+    let text: String = format!("{view:?}").chars().take(160).collect();
+    map.insert((i, generation), format!("{text} buffer={bytes:x?}"));
+}
+
+/// local (diagnostics): the view entry `i` held under `generation` before
+/// the title released its resource, if recorded.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn retired(i: u32, generation: u32) -> Option<String> {
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&(i, generation)).cloned()
 }
 
 /// The view of entry `i` if `generation` is still its own.

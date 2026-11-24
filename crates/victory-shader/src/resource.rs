@@ -114,8 +114,14 @@ pub struct Resources {
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
     /// User SGPRs holding root parameters: value on entry, layout index,
-    /// dword within the parameter.
+    /// dword within the parameter. Also the dwords the program loads from
+    /// its spilled user data (see [`Resources::user_loads`]).
     pub params: Vec<(Value, usize, u32)>,
+    /// Scalar loads reading spilled user data: root parameters past the
+    /// user SGPRs ([`SPILLED_FROM`] on), which arrive in memory whose
+    /// address a user SGPR pair holds. Their results are the parameters'
+    /// values (in `params`), not memory the host has to read.
+    pub user_loads: Vec<Site>,
     pub waterfall: Waterfall,
 }
 
@@ -137,6 +143,13 @@ pub struct Waterfall {
     /// compiler's form): each lane loads its own entry.
     pub loads: Vec<Site>,
 }
+
+/// The first user-data dword of a compute program's spilled user data:
+/// compute has 16 user SGPRs, and a layout placing parameters from dword 16
+/// on has them in memory instead, at the address in the first SGPR pair
+/// no parameter takes (`s[0:1]` in a title's compute programs,
+/// read at byte `4 * (dword - 16)`).
+pub const SPILLED_FROM: u32 = 16;
 
 /// Traces every descriptor and scalar address of `p`, which runs as
 /// `stage`, to the root parameters in `layout`. Fails on the first one it
@@ -162,6 +175,14 @@ pub fn track(
             .collect(),
         ..Resources::default()
     };
+    let mut spilled: Vec<_> = t.spilled.iter().map(|(&v, &d)| (v, d)).collect();
+    spilled.sort_unstable_by_key(|&(v, _)| v.0);
+    for (v, dword) in spilled {
+        if let Some((param, d)) = t.param_at(dword) {
+            out.params.push((v, param, d));
+        }
+    }
+    out.user_loads = t.user_loads.clone();
     // Group accesses in the same loop so a shared mask can select several
     // descriptors together.
     let mut first_lane_at = std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>)>::new();
@@ -172,6 +193,9 @@ pub fn track(
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
+            if t.user_loads.contains(&site) {
+                continue;
+            }
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
@@ -296,6 +320,10 @@ struct Tracer<'a> {
     /// Register per input value.
     inputs: Vec<Option<Reg>>,
     origin: Vec<Term>,
+    /// Loads of spilled user data ([`Resources::user_loads`]).
+    user_loads: Vec<Site>,
+    /// The user-data dword each such load's results hold.
+    spilled: std::collections::HashMap<Value, u32>,
     lanes: Option<&'a Structured>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
@@ -308,6 +336,45 @@ type Known = Vec<(Bool, bool)>;
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
 
+type ValueTables = (
+    Vec<Option<Site>>,
+    Vec<Option<(usize, usize)>>,
+    Vec<Option<Reg>>,
+);
+
+/// Indexes each SSA value's defining site, phi location, and input register.
+fn index_values(p: &Program) -> ValueTables {
+    let all = || {
+        p.inputs
+            .iter()
+            .map(|i| i.1)
+            .chain(p.blocks.iter().flat_map(|b| {
+                b.phis
+                    .iter()
+                    .map(|phi| phi.value)
+                    .chain(b.insts.iter().flat_map(|i| i.writes.iter().map(|w| w.1)))
+            }))
+    };
+    let n = all().map(|v| v.0 as usize + 1).max().unwrap_or(0);
+    let mut defs = vec![None; n];
+    let mut phis = vec![None; n];
+    let mut inputs = vec![None; n];
+    for &(reg, v) in &p.inputs {
+        inputs[v.0 as usize] = Some(reg);
+    }
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, phi) in block.phis.iter().enumerate() {
+            phis[phi.value.0 as usize] = Some((b, i));
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, v) in &inst.writes {
+                defs[v.0 as usize] = Some((b, i));
+            }
+        }
+    }
+    (defs, phis, inputs)
+}
+
 impl<'a> Tracer<'a> {
     fn new(
         p: &'a Program,
@@ -315,34 +382,9 @@ impl<'a> Tracer<'a> {
         stage: HwStage,
         lanes: Option<&'a Structured>,
     ) -> Result<Self, ShaderError> {
-        let all = || {
-            p.inputs
-                .iter()
-                .map(|i| i.1)
-                .chain(p.blocks.iter().flat_map(|b| {
-                    b.phis
-                        .iter()
-                        .map(|phi| phi.value)
-                        .chain(b.insts.iter().flat_map(|i| i.writes.iter().map(|w| w.1)))
-                }))
-        };
-        let n = all().map(|v| v.0 as usize + 1).max().unwrap_or(0);
-        let mut defs = vec![None; n];
-        let mut phis = vec![None; n];
-        let mut inputs = vec![None; n];
-        for &(reg, v) in &p.inputs {
-            inputs[v.0 as usize] = Some(reg);
-        }
-        for (b, block) in p.blocks.iter().enumerate() {
-            for (i, phi) in block.phis.iter().enumerate() {
-                phis[phi.value.0 as usize] = Some((b, i));
-            }
-            for (i, inst) in block.insts.iter().enumerate() {
-                for &(_, v) in &inst.writes {
-                    defs[v.0 as usize] = Some((b, i));
-                }
-            }
-        }
+        // (merge fix25+#439: fix25's index_values, #439's lanes and rpo)
+        let (defs, phis, inputs) = index_values(p);
+        let n = defs.len();
         let mut rpo = vec![usize::MAX; p.blocks.len()];
         for (n, b) in crate::ir::reverse_postorder(&p.blocks)
             .into_iter()
@@ -358,11 +400,125 @@ impl<'a> Tracer<'a> {
             phis,
             inputs,
             origin: Vec::new(),
+            user_loads: Vec::new(),
+            spilled: std::collections::HashMap::new(),
             lanes,
             rpo,
         };
         t.origin = t.propagate_copies(n)?;
+        t.find_spilled();
         Ok(t)
+    }
+
+    /// Whether the layout spills: a compute program with parameters past
+    /// its 16 user SGPRs.
+    fn spills(&self) -> bool {
+        self.stage == HwStage::Cs
+            && self
+                .layout
+                .iter()
+                .any(|p| p.sgprs > 0 && u32::from(p.user_data) + p.sgprs > SPILLED_FROM)
+    }
+
+    /// Finds the scalar loads of spilled user data: `s_load_dword*` from an
+    /// input SGPR pair that holds no parameter (the high dword possibly
+    /// masked to the address's 40 bits), at a constant offset.
+    fn find_spilled(&mut self) {
+        if !self.spills() {
+            return;
+        }
+        let mut loads = Vec::new();
+        for (b, block) in self.p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                let Fields::Smem {
+                    base: Operand::Scalar { code: base, .. },
+                    data: Some(Operand::Scalar { code: data, .. }),
+                    offset,
+                    soffset,
+                    ..
+                } = &inst.fields
+                else {
+                    continue;
+                };
+                if !inst.name().starts_with("s_load_dword") {
+                    continue;
+                }
+                let word = |k| inst.read(Reg::S(base + k)).map(|v| self.origin(v));
+                let (Some(Term::Value(lo)), Some(hi)) = (word(0), word(1)) else {
+                    continue;
+                };
+                let Some(Reg::S(lo_reg)) = self.inputs[lo.0 as usize] else {
+                    continue;
+                };
+                if self.param_of(Reg::S(lo_reg)).is_some() || !self.spill_high(hi, lo_reg + 1) {
+                    continue;
+                }
+                let Some(Term::Const(extra)) = self.term(inst, soffset) else {
+                    continue;
+                };
+                let byte = (*offset as u32).wrapping_add(extra);
+                if byte % 4 != 0 {
+                    continue;
+                }
+                let first = SPILLED_FROM + byte / 4;
+                for &(reg, v) in &inst.writes {
+                    if let Reg::S(r) = reg
+                        && let Some(k) = u32::from(r).checked_sub(u32::from(*data))
+                    {
+                        self.spilled.insert(v, first + k);
+                    }
+                }
+                loads.push((b, i));
+            }
+        }
+        self.user_loads = loads;
+    }
+
+    /// `hi` is input SGPR `reg` (no parameter's), possibly AND-ed with a
+    /// constant (the high bits of a 40-bit address).
+    fn spill_high(&self, hi: Term, reg: u8) -> bool {
+        let is_reg = |t: Term| {
+            matches!(t, Term::Value(v)
+                if self.inputs[v.0 as usize] == Some(Reg::S(reg)) && self.param_of(Reg::S(reg)).is_none())
+        };
+        is_reg(hi)
+            || matches!(hi, Term::Value(v) if self.sop2(v, &["s_and_b32"]).is_some_and(
+                |(_, [a, b])| is_reg(a) && matches!(b, Term::Const(_)) || is_reg(b) && matches!(a, Term::Const(_))
+            ))
+    }
+
+    /// Layout index and dword of the parameter at user-data dword `index`.
+    fn param_at(&self, index: u32) -> Option<(usize, u32)> {
+        self.layout.iter().enumerate().find_map(|(i, p)| {
+            let dword = index.checked_sub(p.user_data.into())?;
+            (dword < p.sgprs).then_some((i, dword))
+        })
+    }
+
+    /// Layout index and dword of the parameter `v` holds: an input SGPR's
+    /// or a spilled dword's.
+    fn param_of_value(&self, v: Value) -> Option<(usize, u32)> {
+        if let Some(&index) = self.spilled.get(&v) {
+            return self.param_at(index);
+        }
+        self.param_of(self.inputs[v.0 as usize]?)
+    }
+
+    /// The value holding user-data dword `index` of a parameter: its input
+    /// SGPR, or one load of it when spilled.
+    fn user_value(&self, index: u32) -> Option<Value> {
+        if self.spills() && index >= SPILLED_FROM {
+            let mut found: Vec<Value> = self
+                .spilled
+                .iter()
+                .filter(|&(_, &d)| d == index)
+                .map(|(&v, _)| v)
+                .collect();
+            found.sort_unstable_by_key(|v| v.0);
+            return found.first().copied();
+        }
+        let reg = Reg::S(self.stage.user_sgpr(u8::try_from(index).ok()?));
+        self.p.inputs.iter().find(|i| i.0 == reg).map(|i| i.1)
     }
 
     /// Optimistic copy propagation: a move's result is its source's
@@ -446,9 +602,14 @@ impl<'a> Tracer<'a> {
     /// Layout index and dword of the root parameter `reg` holds on entry.
     fn param_of(&self, reg: Reg) -> Option<(usize, u32)> {
         let Reg::S(code) = reg else { return None };
+        let spills = self.spills();
         self.layout.iter().enumerate().find_map(|(i, p)| {
             let first = self.stage.user_sgpr(p.user_data);
             let dword = u32::from(code).checked_sub(first.into())?;
+            // Spilled dwords arrive in memory, not in SGPRs.
+            if spills && u32::from(p.user_data) + dword >= SPILLED_FROM {
+                return None;
+            }
             (dword < p.sgprs).then_some((i, dword))
         })
     }
@@ -487,8 +648,8 @@ impl<'a> Tracer<'a> {
             offset: 0,
             dynamic: Some(v),
         };
-        if let Some(reg) = self.inputs[v.0 as usize] {
-            return match self.param_of(reg) {
+        if self.inputs[v.0 as usize].is_some() || self.spilled.contains_key(&v) {
+            return match self.param_of_value(v) {
                 Some((_, 0)) => Sum {
                     base: Some(v),
                     offset: 0,
@@ -646,16 +807,27 @@ impl<'a> Tracer<'a> {
                 dynamic: s.dynamic.or(extra.dynamic),
             });
         }
-        let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
         let (param, _) = self
-            .param_of(reg)
+            .param_of_value(base)
             .ok_or("an address not from a root parameter")?;
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
             RootType::Descriptor => {
-                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
-                let input = self.p.inputs.iter().find(|i| i.0 == high);
-                Some(input.ok_or("a root descriptor without its high half")?.1)
+                let index = u32::from(self.layout[param].user_data) + 1;
+                // Spilled: the high dword the same load read.
+                let same_load = self.spilled.contains_key(&base).then(|| {
+                    self.def(base).and_then(|inst| {
+                        inst.writes
+                            .iter()
+                            .map(|w| w.1)
+                            .find(|v| self.spilled.get(v) == Some(&index))
+                    })
+                });
+                let high = match same_load {
+                    Some(h) => h,
+                    None => self.user_value(index),
+                };
+                Some(high.ok_or("a root descriptor without its high half")?)
             }
             _ => return Err("an address from a root parameter that is no address"),
         };
@@ -1581,7 +1753,8 @@ impl<'a> Tracer<'a> {
         };
         let load = self.defs[v0.0 as usize]?;
         let inst = self.inst(load);
-        if !inst.name().starts_with("s_load_") {
+        // Spilled user data are parameters, not descriptors in memory.
+        if !inst.name().starts_with("s_load_") || self.user_loads.contains(&load) {
             return None;
         }
         let first = inst.writes.iter().position(|w| w.1 == v0)?;
@@ -1597,72 +1770,106 @@ impl<'a> Tracer<'a> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Moved {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Moved {
     Const(u32),
     Value(Value),
+}
+
+/// Resolves every `v_readlane_b32` reading a spilled SGPR back to its scalar value or constant.
+pub(crate) fn spilled_sgprs(p: &Program) -> std::collections::HashMap<Site, Moved> {
+    let (defs, phis, _) = index_values(p);
+    let mut out = std::collections::HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if let Some(m) = restored_with(p, &defs, &phis, inst) {
+                out.insert((b, i), m);
+            }
+        }
+    }
+    out
+}
+
+fn restored_with(
+    p: &Program,
+    defs: &[Option<Site>],
+    phis: &[Option<(usize, usize)>],
+    inst: &Inst,
+) -> Option<Moved> {
+    let Fields::Valu(v) = &inst.fields else {
+        return None;
+    };
+    if inst.name() != "v_readlane_b32" {
+        return None;
+    }
+    let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
+        return None;
+    };
+    spilled_with(
+        p,
+        defs,
+        phis,
+        inst.read(Reg::V(reg))?,
+        lane_of(lane)?,
+        &mut Vec::new(),
+    )
+    .ok()
+    .flatten()
+}
+
+fn spilled_with(
+    p: &Program,
+    defs: &[Option<Site>],
+    phis: &[Option<(usize, usize)>],
+    v: Value,
+    lane: u32,
+    seen: &mut Vec<Value>,
+) -> Result<Option<Moved>, ()> {
+    if let Some((b, i)) = phis[v.0 as usize] {
+        if seen.contains(&v) {
+            return Ok(None);
+        }
+        seen.push(v);
+        let mut found = None;
+        for &a in &p.blocks[b].phis[i].args {
+            if let Some(m) = spilled_with(p, defs, phis, a, lane, seen)? {
+                if found.is_some_and(|f| f != m) {
+                    return Err(());
+                }
+                found = Some(m);
+            }
+        }
+        return Ok(found);
+    }
+    let (b, i) = defs[v.0 as usize].ok_or(())?;
+    let inst = &p.blocks[b].insts[i];
+    let Fields::Valu(w) = &inst.fields else {
+        return Err(());
+    };
+    let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+        return Err(());
+    };
+    if inst.name() != "v_writelane_b32" {
+        return Err(());
+    }
+    if lane_of(*at).ok_or(())? != lane {
+        return spilled_with(p, defs, phis, inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+    }
+    match *value {
+        Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)).map(Moved::Value),
+        Operand::Literal(x) => Some(Moved::Const(x)),
+        Operand::Const(c) => inline(c).map(Moved::Const),
+        _ => None,
+    }
+    .map(Some)
+    .ok_or(())
 }
 
 impl Tracer<'_> {
     /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
     /// lane, found by following the VGPR's `v_writelane_b32` writes.
     fn restored(&self, inst: &Inst) -> Option<Moved> {
-        let Fields::Valu(v) = &inst.fields else {
-            return None;
-        };
-        if inst.name() != "v_readlane_b32" {
-            return None;
-        }
-        let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
-            return None;
-        };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
-            .ok()
-            .flatten()
-    }
-
-    /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
-    /// `seen` (already being resolved), `Err` if not a spilled SGPR.
-    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Moved>, ()> {
-        if let Some((b, i)) = self.phis[v.0 as usize] {
-            if seen.contains(&v) {
-                return Ok(None);
-            }
-            seen.push(v);
-            let mut found = None;
-            for &a in &self.p.blocks[b].phis[i].args {
-                if let Some(m) = self.spilled(a, lane, seen)? {
-                    if found.is_some_and(|f| f != m) {
-                        return Err(());
-                    }
-                    found = Some(m);
-                }
-            }
-            return Ok(found);
-        }
-        let inst = self.def(v).ok_or(())?;
-        let Fields::Valu(w) = &inst.fields else {
-            return Err(());
-        };
-        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
-            return Err(());
-        };
-        if inst.name() != "v_writelane_b32" {
-            return Err(());
-        }
-        if lane_of(*at).ok_or(())? != lane {
-            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
-        }
-        match *value {
-            Operand::Scalar { code, .. } if code != NULL => {
-                inst.read(Reg::S(code)).map(Moved::Value)
-            }
-            Operand::Literal(x) => Some(Moved::Const(x)),
-            Operand::Const(c) => inline(c).map(Moved::Const),
-            _ => None,
-        }
-        .map(Some)
-        .ok_or(())
+        restored_with(self.p, &self.defs, &self.phis, inst)
     }
 }
 
@@ -2267,7 +2474,7 @@ pub(crate) mod tests {
         0xBF81_0000, // s_endpgm
     ];
 
-    /// The console compiler's waterfall (Grand Theft Auto VI's ray-tracing
+    /// The console compiler's waterfall (a title's ray-tracing
     /// resolve and others): each lane holds its entry's byte offset in the
     /// table at s0 (v7 = (lane & 1) * 32); the loop reads the first active
     /// lane's offset, narrows EXEC to the lanes with the same one
@@ -3049,5 +3256,107 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod spilled_tests {
+    use super::*;
+    use crate::native::RootType::*;
+
+    /// A synthetic compute program whose parameters all lie past the 16 user
+    /// SGPRs: it reads them from the table `s[0:1]` points at (a root
+    /// descriptor at byte 8, four constants at byte 0x10) and stores through
+    /// a buffer descriptor it builds around the root descriptor.
+    const FILL: &[u32] = &[
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0x8703_FF01,
+        0x0000_FFFF, // s_and_b32 s3, s1, 0xffff
+        0xF404_0101,
+        0xFA00_0008, // s_load_dwordx2 s[4:5], s[2:3], 0x8
+        0xF408_0201,
+        0xFA00_0010, // s_load_dwordx4 s[8:11], s[2:3], 0x10
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7DA8_0008, // v_cmpx_gt_u32 exec_lo, s8, v0
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x7E02_0209, // v_mov_b32 v1, s9
+        0xBE86_03C1, // s_mov_b32 s6, -1
+        0xBE87_03FF,
+        0x1101_4FAC, // s_mov_b32 s7, 0x11014fac (32-bit data, xyzw)
+        0xBE85_1D90, // s_bitset1_b32 s5, 16
+        0xE070_1000,
+        0x8001_0104, // buffer_store_dword v1, v4, s[4:7], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+
+    fn param(root: RootType, user_data: u8, sgprs: u32, slot: u8) -> RootParam {
+        RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: 0,
+            user_data,
+            slot,
+        }
+    }
+
+    fn program() -> Program {
+        let code: Vec<u8> = FILL.iter().flat_map(|w| w.to_le_bytes()).collect();
+        crate::ir::build(&code, false, 256).unwrap()
+    }
+
+    #[test]
+    fn spilled_user_data_are_parameters() {
+        let layout = [
+            param(Descriptor, 16, 2, 0),
+            param(Descriptor, 18, 2, 1),
+            param(Constants, 20, 16, 2),
+        ];
+        let r = track(&program(), &layout, HwStage::Cs, None).unwrap();
+        // Both loads read the spill table: no memory access left.
+        assert_eq!(r.user_loads, [(0, 2), (0, 3)]);
+        assert!(r.scalar.is_empty());
+        // The UAV descriptor is built around root descriptor 1 (byte 8 of
+        // the table = user data 18).
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Built {
+                address: Address {
+                    param: 1,
+                    offset: 0,
+                    dynamic: None
+                },
+                bits: 1 << 16,
+                words: [u32::MAX, 0x1101_4FAC]
+            }
+        );
+        // Byte 0x10 = user data 20: the constants from their first dword.
+        let mut got: Vec<_> = r.params.iter().map(|p| (p.1, p.2)).collect();
+        got.sort_unstable();
+        let mut want: Vec<_> = (0..4).map(|d| (2, d)).chain([(1, 0), (1, 1)]).collect();
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn without_a_spilling_layout_the_table_is_untraced() {
+        // The same code with its parameters in SGPRs: s[0:1] is then no
+        // parameter's and the loads stay unsupported, as before.
+        let layout = [param(Descriptor, 4, 2, 0), param(Constants, 6, 8, 1)];
+        let err = track(&program(), &layout, HwStage::Cs, None).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 0xc,
+                what: "an address in an SGPR that is no root parameter"
+            }
+        );
+    }
+
+    #[test]
+    fn only_compute_spills() {
+        // A pixel program with the same layout keeps the SGPR model.
+        let layout = [param(Descriptor, 18, 2, 1), param(Constants, 20, 16, 2)];
+        assert!(track(&program(), &layout, HwStage::Ps, None).is_err());
     }
 }

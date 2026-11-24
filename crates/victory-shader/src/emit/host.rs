@@ -9,8 +9,8 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{Interface, PCSTR};
 
-use super::HostShader;
 use super::container::SigElement;
+use super::{HostShader, Wave64Mode};
 use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
@@ -62,10 +62,73 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Whether an adapter is hardware. A machine without a GPU (a CI runner)
+/// can list the Microsoft Basic Render Driver, which is WARP, as an
+/// ordinary adapter without the software flag: its ids, or its name, tell.
+fn hardware(d: &DXGI_ADAPTER_DESC1) -> bool {
+    let basic_render_driver = d.VendorId == 0x1414 && d.DeviceId == 0x8c
+        || description(&d.Description) == "Microsoft Basic Render Driver";
+    d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && !basic_render_driver
+}
+
+/// The hardware adapters, in DXGI's order: each one's description.
+pub fn adapters() -> Result<Vec<String>, String> {
+    // SAFETY: plain DXGI calls.
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Ok(a) = factory.EnumAdapters1(i) {
+            let d = a.GetDesc1().map_err(err)?;
+            if hardware(&d) {
+                out.push(description(&d.Description));
+            }
+            i += 1;
+        }
+        Ok(out)
+    }
+}
+
+fn description(wide: &[u16]) -> String {
+    let n = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+    String::from_utf16_lossy(&wide[..n])
+}
+
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`), or
+    /// the first hardware adapter whose description holds
+    /// `VICTORY_ADAPTER` (ignoring case: `nvidia`, `radeon`...).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        match std::env::var("VICTORY_ADAPTER") {
+            Ok(name) if !warp && !name.is_empty() => Self::on(&name),
+            _ => Self::create(warp, None),
+        }
+    }
+
+    /// The first hardware adapter whose description holds `name`,
+    /// ignoring case.
+    pub fn on(name: &str) -> Result<Self, String> {
+        let want = name.to_lowercase();
+        // SAFETY: plain DXGI calls.
+        let adapter = unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
+            let mut i = 0;
+            loop {
+                let a = factory
+                    .EnumAdapters1(i)
+                    .map_err(|_| format!("no adapter named {name:?}"))?;
+                let d = a.GetDesc1().map_err(err)?;
+                if hardware(&d) && description(&d.Description).to_lowercase().contains(&want) {
+                    break a;
+                }
+                i += 1;
+            }
+        };
+        Self::create(false, Some(adapter.cast().map_err(err)?))
+    }
+
+    fn create(warp: bool, adapter: Option<IDXGIAdapter>) -> Result<Self, String> {
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             let mut device: Option<ID3D12Device> = None;
@@ -74,6 +137,8 @@ impl Host {
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            } else if let Some(adapter) = &adapter {
+                D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             }
@@ -95,6 +160,75 @@ impl Host {
                 ));
             }
             Ok(Host { device })
+        }
+    }
+
+    /// Wave-operation support and `(min, max)` hardware lane counts.
+    pub fn wave_lanes(&self) -> (bool, u32, u32) {
+        let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: plain D3D12 feature query with valid struct size.
+        let ok = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut opts).cast(),
+                size_of_val(&opts) as u32,
+            )
+        }
+        .is_ok();
+        if !ok {
+            return (false, 0, 0);
+        }
+        (
+            opts.WaveOps.as_bool(),
+            opts.WaveLaneCountMin,
+            opts.WaveLaneCountMax,
+        )
+    }
+
+    /// Whether the host supports compute shaders requiring 64-lane waves.
+    pub fn supports_wave64(&self) -> bool {
+        let (ops, min, max) = self.wave_lanes();
+        ops && min <= 64 && max >= 64
+    }
+
+    /// Whether the host supports compute shaders requiring 32-lane waves.
+    pub fn supports_wave32(&self) -> bool {
+        let (ops, min, max) = self.wave_lanes();
+        ops && min <= 32 && max >= 32
+    }
+
+    /// Best Wave64 compute lowering strategy supported by this host device.
+    pub fn recommended_wave64_mode(&self) -> Wave64Mode {
+        if self.supports_wave64() {
+            Wave64Mode::Native
+        } else if self.supports_wave32() {
+            Wave64Mode::Wave32
+        } else {
+            Wave64Mode::Emulate
+        }
+    }
+
+    /// The wave sizes the device runs ([`super::Target::ANY`] if it does
+    /// not say).
+    pub fn target(&self) -> super::Target {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes the structure of the given size.
+        let ok = unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+                .is_ok()
+        };
+        if ok && o.WaveOps.as_bool() && o.WaveLaneCountMin > 0 {
+            super::Target {
+                lanes_min: o.WaveLaneCountMin,
+                lanes_max: o.WaveLaneCountMax,
+            }
+        } else {
+            super::Target::ANY
         }
     }
 
@@ -132,26 +266,40 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        let mut views: Vec<(u8, bool)> = stages
+        let mut views: Vec<(u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, false));
-                cbvs.chain(s.root_srvs.iter().map(|&r| (r, true)))
+                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
+                cbvs.chain(s.root_srvs.iter().map(|&r| (r, 1)))
+                    .chain(s.root_uavs.iter().map(|&r| (r, 2)))
             })
             .collect();
         views.sort_unstable();
         views.dedup();
-        for (slot, srv) in views {
+        for (slot, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: if srv {
-                    D3D12_ROOT_PARAMETER_TYPE_SRV
-                } else {
-                    D3D12_ROOT_PARAMETER_TYPE_CBV
+                ParameterType: match kind {
+                    0 => D3D12_ROOT_PARAMETER_TYPE_CBV,
+                    1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    _ => D3D12_ROOT_PARAMETER_TYPE_UAV,
                 },
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                         ShaderRegister: u32::from(slot),
                         RegisterSpace: super::ROOT_CBV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
+        if stages.iter().any(|(s, _)| s.stride_table) {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: super::STRIDE_SPACE,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                     },
                 },
@@ -466,7 +614,7 @@ pub fn stub_vs(ps: &HostShader) -> Result<HostShader, String> {
             half: false,
         });
     }
-    Ok(stub(false, outputs))
+    Ok(stub(false, outputs, 0))
 }
 
 /// A pixel shader that reads nothing and writes target 0.
@@ -483,19 +631,42 @@ pub fn stub_ps() -> HostShader {
         usage: 0,
         half: false,
     };
-    stub(true, vec![target])
+    stub(true, vec![target], 0)
 }
 
-fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
+/// local (diagnostics): a pixel shader that reads nothing and writes 1.0 to
+/// every channel of targets `0..targets`: where a pipeline's geometry
+/// rasterizes, its targets turn white (tells geometry from pixel shading).
+pub fn flat_ps(targets: u32) -> HostShader {
+    let outputs = (0..targets.clamp(1, 8))
+        .map(|i| SigElement {
+            name: "SV_Target".into(),
+            index: i,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(i),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        })
+        .collect();
+    stub(true, outputs, 1.0f32.to_bits())
+}
+
+/// A shader writing `value` (float bits; integers get 0 or 1) to every
+/// output channel.
+fn stub(pixel: bool, outputs: Vec<SigElement>, value: u32) -> HostShader {
     use super::bitcode::{Attr, Term};
     let mut s = super::shader::Shader::new(pixel);
     let b = s.entry;
     for (id, e) in outputs.iter().enumerate() {
         for col in 0..e.cols {
             let (suffix, zero) = if e.comp == 9 {
-                (".f32", s.m.f32(0))
+                (".f32", s.m.f32(value))
             } else {
-                (".i32", s.m.i32(0))
+                (".i32", s.m.i32(u32::from(value != 0)))
             };
             let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), zero];
             s.op(
@@ -528,6 +699,8 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        stride_table: false,
     }
 }
 
@@ -546,6 +719,9 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// local: a root UAV over a zeroed buffer of this many dwords, read
+    /// back after the dispatch (after the heap UAVs; [`Host::dispatch`] only).
+    Uav(u32),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -784,6 +960,7 @@ impl Host {
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
                     Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::Uav(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -958,6 +1135,41 @@ impl Host {
         root: &ID3D12RootSignature,
         pso: &ID3D12PipelineState,
         d: &Dispatch,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_impl(root, pso, d, None)
+    }
+
+    /// Runs a mesh pipeline with `groups` mesh thread groups and returns each
+    /// UAV's contents in heap order.
+    pub fn dispatch_mesh(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        groups: u32,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_impl(root, pso, d, Some((groups, 1)))
+    }
+
+    /// Runs `count` mesh dispatches in one command list (dispatch cost, where
+    /// per-list overhead is amortized).
+    pub fn dispatch_mesh_repeat(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        groups: u32,
+        count: u32,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_impl(root, pso, d, Some((groups, count)))
+    }
+
+    fn dispatch_impl(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        mesh: Option<(u32, u32)>,
     ) -> Result<Vec<Vec<u32>>, String> {
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -1289,15 +1501,32 @@ impl Host {
                 dev.CreateSampler(s, at);
             }
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
-            list.SetComputeRootSignature(root);
+            // A mesh pipeline is a graphics pipeline, so its root arguments
+            // go through the graphics root signature.
+            if mesh.is_some() {
+                list.SetGraphicsRootSignature(root);
+            } else {
+                list.SetComputeRootSignature(root);
+            }
             for (param, arg) in &d.roots {
                 match arg {
-                    Root::Constants(data) => list.SetComputeRoot32BitConstants(
-                        *param,
-                        data.len() as u32,
-                        data.as_ptr().cast(),
-                        0,
-                    ),
+                    Root::Constants(data) => {
+                        if mesh.is_some() {
+                            list.SetGraphicsRoot32BitConstants(
+                                *param,
+                                data.len() as u32,
+                                data.as_ptr().cast(),
+                                0,
+                            )
+                        } else {
+                            list.SetComputeRoot32BitConstants(
+                                *param,
+                                data.len() as u32,
+                                data.as_ptr().cast(),
+                                0,
+                            )
+                        }
+                    }
                     Root::Table { sampler, index } => {
                         let (h, size) = if *sampler {
                             (&samplers, sampler_size)
@@ -1306,22 +1535,57 @@ impl Host {
                         };
                         let mut at = h.GetGPUDescriptorHandleForHeapStart();
                         at.ptr += (index * size) as u64;
-                        list.SetComputeRootDescriptorTable(*param, at);
+                        if mesh.is_some() {
+                            list.SetGraphicsRootDescriptorTable(*param, at);
+                        } else {
+                            list.SetComputeRootDescriptorTable(*param, at);
+                        }
                     }
                     Root::View { srv, data } => {
                         let b = upload(data)?;
                         let va = b.GetGPUVirtualAddress();
-                        if *srv {
+                        if mesh.is_some() {
+                            if *srv {
+                                list.SetGraphicsRootShaderResourceView(*param, va);
+                            } else {
+                                list.SetGraphicsRootConstantBufferView(*param, va);
+                            }
+                        } else if *srv {
                             list.SetComputeRootShaderResourceView(*param, va);
                         } else {
                             list.SetComputeRootConstantBufferView(*param, va);
                         }
                         keep.push(b);
                     }
+                    Root::Uav(n) => {
+                        let bytes = u64::from(*n) * 4;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COMMON,
+                        )?;
+                        list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((b, None, *n, rb));
+                    }
                 }
             }
-            let [x, y, z] = d.groups;
-            list.Dispatch(x, y, z);
+            match mesh {
+                Some((groups, count)) => {
+                    let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
+                    for _ in 0..count {
+                        list6.DispatchMesh(groups, 1, 1);
+                    }
+                }
+                None => {
+                    let [x, y, z] = d.groups;
+                    list.Dispatch(x, y, z);
+                }
+            }
             for (r, size, n, rb) in &uavs {
                 // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
@@ -1376,6 +1640,51 @@ impl Host {
             }
             drop(keep);
             Ok(out)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emit::bitcode::Term;
+    use crate::emit::shader::Shader;
+
+    fn cs_with_wave_size(wave_size: Option<u32>) -> HostShader {
+        let mut s = Shader::new(false);
+        s.threads = Some([64, 1, 1]);
+        s.wave_size = wave_size;
+        s.m.terminate(s.entry, Term::Ret);
+        HostShader {
+            stage: crate::HwStage::Cs,
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            stride_table: false,
+        }
+    }
+
+    #[test]
+    fn recommended_wave64_mode_matches_device_capabilities() {
+        for warp in [false, true] {
+            let Ok(h) = Host::new(warp) else {
+                continue;
+            };
+            let mode = h.recommended_wave64_mode();
+            let required_wave = match mode {
+                Wave64Mode::Native => Some(64),
+                Wave64Mode::Wave32 => Some(32),
+                Wave64Mode::Emulate => None,
+            };
+            h.compute_pipeline(&cs_with_wave_size(required_wave))
+                .expect("recommended Wave64 mode should build a compute PSO");
+            if warp {
+                assert_eq!(mode, Wave64Mode::Emulate);
+            }
         }
     }
 }

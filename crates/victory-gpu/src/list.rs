@@ -106,7 +106,7 @@ struct List {
     graphics_root_headers: [u32; 128],
     compute_root_headers: [u32; 128],
     pipeline_shadow: [u32; 8],
-    /// Newer titles' lists are larger: Grand Theft Auto VI's state flush
+    /// Newer titles' lists are larger: a title's state flush
     /// (title+0x32786) copies a pipeline's 32 bytes to +0x544..+0x564 and
     /// tests +0x548, so its layout runs past 0x560. Its size is unknown;
     /// this keeps our fields clear of whatever the title writes there.
@@ -131,6 +131,33 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
+/// The dynamic descriptor slots of a title list, if there is a host GPU.
+#[cfg(windows)]
+fn lease(this: This) -> Option<std::sync::Arc<crate::descriptor::lease::Lease>> {
+    host_list(this)?;
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    let state = state.lock().unwrap_or_else(|e| e.into_inner());
+    Some(state.lease().clone())
+}
+
+/// Before a list is submitted: false if the slots of its tables were taken
+/// back after an earlier submission (a heap ran short, see
+/// [`crate::descriptor::lease`]); it must not run again until it is reset.
+/// Until [`finished`] its slots cannot be taken back.
+#[cfg(windows)]
+pub(crate) fn may_run(this: This) -> bool {
+    lease(this).is_none_or(|lease| lease.start())
+}
+
+/// After a list ran: its slots may be taken back if a heap runs short.
+#[cfg(windows)]
+pub(crate) fn finished(this: This) {
+    if let Some(lease) = lease(this) {
+        lease.finish();
+    }
 }
 
 /// The host list behind a title list, if there is a host GPU.
@@ -446,6 +473,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if crate::resource::skip_mixed_packed_copy("CopyResource", to, from) {
+                return;
+            }
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
@@ -481,6 +511,84 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
+/// Stages a buffer-to-texture `CopyTextureRegion` source into an upload buffer
+/// filled at submission. When the destination was widened from a packed 16-bit
+/// format to `R8G8B8A8_UNORM` on this GPU, the upload footprint is widened and
+/// the texels are expanded on the CPU at submission.
+#[cfg(windows)]
+fn prepare_footprint_upload(
+    list: &crate::host::HostList,
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    src: CopyLocation,
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    CopyLocation,
+    u64,
+)> {
+    use windows::core::Interface;
+    let host = crate::host::host()?;
+    let bytes = src.footprint.bytes()?;
+    let data = buffer_range(src.resource, src.footprint.offset, bytes)?;
+    // SAFETY: a live host resource.
+    let dst_fmt = unsafe { to.GetDesc() }.Format.0 as u32;
+    let src_fmt = crate::resource::pc_format(src.footprint.format);
+    let mut from = src;
+    if dst_fmt == crate::resource::RGBA8_UNORM && crate::resource::PACKED_16.contains(&src_fmt) {
+        if src.footprint.width == 0 || src.footprint.height == 0 || src.footprint.depth == 0 {
+            return None;
+        }
+        if u64::from(src.footprint.row_pitch) < u64::from(src.footprint.width) * 2 {
+            tracing::warn!(
+                footprint = ?src.footprint,
+                "packed 16-bit copy footprint row pitch is smaller than a row"
+            );
+            return None;
+        }
+        let row_pitch = u64::from(src.footprint.width)
+            .checked_mul(4)?
+            .next_multiple_of(256);
+        let widened = crate::resource::PlacedFootprint {
+            offset: 0,
+            format: crate::resource::RGBA8_UNORM,
+            row_pitch: u32::try_from(row_pitch).ok()?,
+            ..src.footprint
+        };
+        let dst_bytes = widened.bytes()?;
+        let lines =
+            usize::try_from(u64::from(src.footprint.height) * u64::from(src.footprint.depth))
+                .ok()?;
+        let (src_len, dst_len) = (
+            usize::try_from(bytes).ok()?,
+            usize::try_from(dst_bytes).ok()?,
+        );
+        let (buffer, staging) = list.upload(host, dst_bytes)?;
+        let (width, src_pitch, dst_pitch) = (
+            src.footprint.width as usize,
+            src.footprint.row_pitch as usize,
+            widened.row_pitch as usize,
+        );
+        let (src_at, dst_at) = (data as usize, staging as usize);
+        list.defer_host(move || {
+            let mut packed = vec![0u8; src_len];
+            crate::host::copy_mapped(packed.as_mut_ptr(), src_at as *const u8, src_len, false);
+            // SAFETY: `staging` is the persistent mapping of `buffer`, kept
+            // alive in the list's `uploads` until the list is reset.
+            let dst = unsafe { std::slice::from_raw_parts_mut(dst_at as *mut u8, dst_len) };
+            crate::resource::expand_packed16_rows(
+                src_fmt, width, lines, &packed, src_pitch, dst, dst_pitch,
+            );
+        });
+        from.resource = buffer.as_raw().cast_const().cast();
+        from.footprint = widened;
+        return Some((buffer, from, dst_bytes));
+    }
+    let (buffer, staging) = list.upload(host, bytes)?;
+    list.defer_copy(staging, data, bytes as usize);
+    from.resource = buffer.as_raw().cast_const().cast();
+    from.footprint.offset = 0;
+    Some((buffer, from, bytes))
+}
+
 /// Texture to texture on the GPU; buffer to texture through an upload
 /// buffer filled at submission. Texture to buffer (read back) is not done
 /// yet.
@@ -507,8 +615,7 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            copy_texture_to_buffer(list, dst, src, x, y, z, source_box);
             return;
         };
         let mut from = src;
@@ -516,30 +623,25 @@ extern "system" fn copy_texture_region(
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
-            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+            let Some((buffer, staged, bytes)) = prepare_footprint_upload(list, to, src) else {
                 return;
             };
-            let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
-                return;
-            };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
-            };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
-            from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from = staged;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
                 read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
             }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = bytes;
             _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::resource::skip_mixed_packed_copy("CopyTextureRegion", to, texture) {
+                return;
+            }
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
@@ -592,6 +694,126 @@ extern "system" fn copy_texture_region(
     let _ = (this, dst, x, y, z, src, source_box);
 }
 
+/// Texture to buffer (`CopyTextureRegion` with a placed footprint as the
+/// destination): the title reads back what the GPU made (luminance,
+/// depth, GPU-built data) from title memory. The host copies the texture
+/// into the destination buffer's host copy, at the footprint's place, and
+/// the range goes back to title memory once the submission has run, the
+/// way shader writes do ([`crate::shadow::Shadow::gpu_writes`]).
+///
+/// Refused (logged once per reason, never silently): a destination that
+/// is not a title buffer, a footprint the host cannot place (offset not
+/// on 512 bytes, row pitch not on 256), a packed 16-bit texture the host
+/// widened.
+#[cfg(windows)]
+fn copy_texture_to_buffer(
+    list: &crate::host::HostList,
+    dst: CopyLocation,
+    src: CopyLocation,
+    x: u32,
+    y: u32,
+    z: u32,
+    source_box: *const [u32; 6],
+) {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
+    use windows::core::Interface;
+    const FOOTPRINT: u32 = 1;
+    let refuse = |why: &'static str| {
+        static SEEN: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&why) {
+            seen.push(why);
+            tracing::warn!(
+                why,
+                footprint = ?dst.footprint,
+                kind = dst.kind,
+                "texture to buffer copy not done"
+            );
+        }
+    };
+    if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
+        return refuse("not a texture subresource to a placed footprint");
+    }
+    let Some(texture) = crate::resource::host_resource(src.resource) else {
+        return refuse("source is no host texture");
+    };
+    let Some(bytes) = dst.footprint.bytes() else {
+        return refuse("footprint format without a known element size");
+    };
+    let Some((data, size)) = crate::resource::buffer_bytes(dst.resource) else {
+        return refuse("destination is no title buffer");
+    };
+    if dst
+        .footprint
+        .offset
+        .checked_add(bytes)
+        .is_none_or(|end| end > size)
+    {
+        return refuse("footprint outside its buffer");
+    }
+    // SAFETY: a live host texture.
+    let host_format = unsafe { texture.GetDesc() }.Format.0 as u32;
+    let format = crate::resource::pc_format(dst.footprint.format);
+    if host_format != format && crate::resource::PACKED_16.contains(&format) {
+        // The host texture was widened to R8G8B8A8: its texels would have
+        // to be packed back on the CPU.
+        return refuse("packed 16-bit texture widened on the host");
+    }
+    let address = data as u64 + dst.footprint.offset;
+    let Some(shadow) = crate::shadow::find(address, bytes) else {
+        return refuse("no host copy of the destination buffer");
+    };
+    let at = shadow.offset(address);
+    if at % 512 != 0 || dst.footprint.row_pitch % 256 != 0 {
+        return refuse("footprint not on the host's placement alignment");
+    }
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src.resource, texture);
+    }
+    // The bytes the copy leaves alone (row padding) stay the title's.
+    shadow.refresh(list, address, bytes);
+    ensure_state(list, src.resource, COPY_SOURCE);
+    let mut to = dst;
+    to.resource = shadow.buffer.as_raw().cast_const().cast();
+    to.footprint.offset = at;
+    to.footprint.format = format;
+    let mut from = src;
+    from.resource = texture.as_raw().cast_const().cast();
+    let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| {
+        format!(
+            "copy texture {:?} sub {} to buffer {address:#x} footprint {:?} at {x},{y},{z}",
+            src.resource, src.kind, dst.footprint
+        )
+    });
+    const _: () =
+        assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+    // SAFETY: an open list; the destination is a host buffer (implicitly
+    // promoted to a copy destination) with the footprint inside it, the
+    // source a live texture in the copy source state.
+    unsafe {
+        list.list.CopyTextureRegion(
+            (&raw const to).cast(),
+            x,
+            y,
+            z,
+            (&raw const from).cast(),
+            host_box,
+        )
+    };
+    shadow.gpu_writes(list, address, bytes);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::info!(
+            address = format_args!("{address:#x}"),
+            bytes,
+            format,
+            "texture to buffer copies go back to title memory"
+        )
+    });
+}
+
 #[allow(clippy::too_many_arguments)] // the method's own arguments
 extern "system" fn copy_texture_region_x(
     this: This,
@@ -621,6 +843,9 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
+        if crate::resource::skip_mixed_packed_copy("ResolveSubresource", to, from) {
+            return;
+        }
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
@@ -632,6 +857,7 @@ extern "system" fn resolve(
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
+        let format = crate::resource::target_format(format);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
@@ -872,7 +1098,35 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
 /// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+///
+/// local: on the host, draws and dispatches with no barrier between them
+/// may overlap, so a pass could read what the one before it has not
+/// written yet. The console's sync is where the title orders them: it
+/// becomes an unordered access barrier on every resource
+/// (`VICTORY_SYNC_BARRIER=0` restores upstream).
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("VICTORY_SYNC_BARRIER").map_or(true, |v| v.trim() != "0")) {
+            return;
+        }
+        if let Some(list) = host_list(this) {
+            static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n == 0 {
+                tracing::info!("sync: pipeline syncs become UAV barriers");
+            }
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+            // SAFETY: the same layout; no resource named.
+            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -882,7 +1136,7 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 
 /// Newer lists' 0x4a0 `(size, alignment) -> pointer`: memory the list
 /// owns until it is reset, which the CPU writes and the GPU reads at the
-/// same address; null on failure. Grand Theft Auto VI's BVH builder puts
+/// same address; null on failure. a title's BVH builder puts
 /// its instance descriptions there (and wrote through our old
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
@@ -1141,7 +1395,7 @@ extern "system" fn draw(_: This) {
 }
 
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
-/// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
+/// offset)`. a title's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
 /// (12), mesh dispatch (12), and the console's single-pass dispatch, type
 /// 105 (stride 12: the three group counts; its flags live in the
@@ -1165,8 +1419,26 @@ extern "system" fn execute_indirect(
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
+    // local: `VICTORY_INDIRECT_SKIP=all` or a comma list of argument kinds
+    // (0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch, 105 single
+    // dispatch) drops those indirect executions, to isolate host failures.
+    static SKIP: std::sync::OnceLock<Option<Vec<u32>>> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        let v = std::env::var("VICTORY_INDIRECT_SKIP").ok()?;
+        let v = v.trim();
+        if v.eq_ignore_ascii_case("all") {
+            return Some(Vec::new());
+        }
+        Some(v.split(',').filter_map(|k| k.trim().parse().ok()).collect())
+    });
+    let skipped = match (skip, args) {
+        (Some(list), _) if list.is_empty() => true,
+        (Some(list), [[kind, ..]]) => list.contains(kind),
+        _ => false,
+    };
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
+    if !skipped
+        && let ([[kind, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
     {
         const DISPATCH: u32 = 2;
@@ -1356,7 +1628,7 @@ const MORE_METHODS: [(usize, *const ()); 9] = [
 /// base list, after the clears (0x198/0x1a0 as before) and before
 /// ExecuteIndirect, which moved from 0x1d8 to 0x1e8: every slot from 0x1d8
 /// on is two later (taken here as starting exactly at 0x1d8). Inferred from
-/// Grand Theft Auto VI's call shapes: ExecuteIndirect 0x1e8, bottom-of-pipe
+/// a title's call shapes: ExecuteIndirect 0x1e8, bottom-of-pipe
 /// writes 0x238/0x240, waits 0x248/0x250, depth bounds 0x230, shading rate
 /// 0x3f0/0x400, syncs 0x418/0x420, ResetX 0x458 (asserts on failure).
 const fn newer_slot(slot: usize) -> usize {
@@ -1366,7 +1638,7 @@ const fn newer_slot(slot: usize) -> usize {
 /// Methods only newer titles' lists have. 0x490: the enhanced barrier
 /// `(group count, groups)`, with 16-byte groups `(type, count, barriers)`
 /// and 40-byte buffer barriers (title+0x95e0 builds them). 0x470 `(u64)`,
-/// called from Grand Theft Auto VI's state flush with its result unused.
+/// called from a title's state flush with its result unused.
 /// shortcut: 0x470's purpose is unknown; ignored until a title shows it
 /// matters.
 const NEWER_METHODS: [(usize, *const ()); 3] = [

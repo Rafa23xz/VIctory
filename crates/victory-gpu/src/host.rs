@@ -61,6 +61,52 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
+/// A host resource waiting to be dropped after in-flight GPU work finishes.
+struct Retired {
+    frame: u64,
+    #[allow(dead_code)]
+    resource: ID3D12Resource,
+}
+
+// SAFETY: D3D12 resources are free-threaded and may be released on any thread.
+unsafe impl Send for Retired {}
+
+/// Host resources retired on worker threads (for example when a descriptor
+/// slot is overwritten or a title resource is released while a submission is
+/// executing on the GPU). Kept alive for several presented frames because a
+/// single title frame spans many submissions and worker threads may record
+/// lists ahead of presentation.
+static RETIRED: Mutex<Vec<Retired>> = Mutex::new(Vec::new());
+
+/// Holds `resource` alive until several full frames have completed on the GPU.
+pub(crate) fn retire(resource: ID3D12Resource) {
+    let frame = crate::queue::presented();
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Retired { frame, resource });
+}
+
+/// Ages are in frames presented to the host (not the title's 60 Hz clock, which
+/// ticks many times per frame while the host runs at 1-2 fps).
+/// Takes retired resources old enough to drop once the current submission
+/// finishes on the GPU.
+fn take_retired() -> Vec<Retired> {
+    const KEEP_FRAMES: u64 = 4;
+    let now = crate::queue::presented();
+    let mut guard = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ready = Vec::new();
+    let mut i = 0;
+    while i < guard.len() {
+        if now.saturating_sub(guard[i].frame) >= KEEP_FRAMES {
+            ready.push(guard.swap_remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    ready
+}
+
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
@@ -208,6 +254,9 @@ fn create() -> windows::core::Result<Host> {
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         tracing::info!("host D3D12 device ready");
+        let wave64_mode = recommended_wave64_mode(&device);
+        crate::shader_cache::set_wave64_mode(wave64_mode);
+        tracing::info!(?wave64_mode, "Wave64 compute lowering mode selected");
         Ok(Host {
             device,
             queue,
@@ -223,6 +272,31 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+/// Queries D3D12 wave lane capabilities and chooses the Wave64 lowering mode.
+fn recommended_wave64_mode(device: &ID3D12Device) -> victory_shader::emit::Wave64Mode {
+    use victory_shader::emit::Wave64Mode;
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: plain D3D12 feature query with valid struct size.
+    let ok = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut opts).cast(),
+            size_of_val(&opts) as u32,
+        )
+    }
+    .is_ok();
+    if !ok || !opts.WaveOps.as_bool() {
+        return Wave64Mode::Emulate;
+    }
+    if opts.WaveLaneCountMin <= 64 && opts.WaveLaneCountMax >= 64 {
+        Wave64Mode::Native
+    } else if opts.WaveLaneCountMin <= 32 && opts.WaveLaneCountMax >= 32 {
+        Wave64Mode::Wave32
+    } else {
+        Wave64Mode::Emulate
     }
 }
 
@@ -411,6 +485,10 @@ struct Deferred {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// local (diagnostics): set once the list's submission has run and been
+    /// copied back (what [`crate::capture::sample_indirect`] waits for).
+    #[cfg(feature = "diagnostics")]
+    ran: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Host {
@@ -510,6 +588,7 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        let retired = take_retired();
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -574,6 +653,7 @@ impl Host {
                 last_notes(runs)
             ));
         }
+        drop(retired);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -598,6 +678,16 @@ impl Host {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // local (diagnostics): the lists' indirect samples can be read now.
+        #[cfg(feature = "diagnostics")]
+        {
+            for list in runs {
+                for ran in &list.deferred().ran {
+                    ran.store(true, Ordering::Relaxed);
+                }
+            }
+            crate::capture::drain_indirect();
+        }
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
@@ -758,8 +848,23 @@ impl Host {
         unsafe {
             let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
             handle.ptr += (slot * self.rtv_size) as usize;
+            let d = resource.GetDesc();
+            if d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0 {
+                let null_desc = D3D12_RENDER_TARGET_VIEW_DESC {
+                    Format: desc.map_or(DXGI_FORMAT_R8G8B8A8_UNORM, |x| x.Format),
+                    ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                    ..Default::default()
+                };
+                self.device
+                    .CreateRenderTargetView(None::<&ID3D12Resource>, Some(&null_desc), handle);
+                return handle;
+            }
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
+            crate::descriptor::host::checked(|| {
+                let v = desc.map(|x| (x.Format.0, x.ViewDimension.0));
+                format!("render target view (format, dimension) {v:?} of {d:?}")
+            });
             handle
         }
     }
@@ -777,6 +882,10 @@ impl Host {
             handle.ptr += (slot * self.dsv_size) as usize;
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
+            crate::descriptor::host::checked(|| {
+                let v = desc.map(|x| (x.Format.0, x.ViewDimension.0, x.Flags.0));
+                format!("depth view (format, dimension, flags) {v:?} of {:?}", resource.GetDesc())
+            });
             handle
         }
     }
@@ -1130,6 +1239,15 @@ impl HostList {
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
+    /// local (diagnostics): a flag set once the list's submission has run
+    /// and its copy-back is done.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn ran_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.deferred().ran.push(flag.clone());
+        flag
+    }
+
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
@@ -1176,7 +1294,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_written_at(dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -1213,6 +1331,7 @@ impl HostList {
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data.
                     batch.flush();
+                    batch.forget(*address, *len);
                     shadow.writing(*address, *len);
                     continue;
                 }
@@ -1242,6 +1361,12 @@ struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// local: ranges refreshed in this submission since our last write of
+    /// title memory there, per buffer copy. Refreshed again, they are left
+    /// alone: the title's own CPU writes meanwhile race with the submission
+    /// as they would with the first refresh, and asking the kernel again
+    /// for a big buffer's written pages costs ~0.3 ms per 4 MB.
+    done: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
 }
 
 impl Batch {
@@ -1268,18 +1393,87 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        self.done.clear();
+    }
+
+    /// Refreshed ranges no longer up to date in `[at, at + len)` (title
+    /// memory we write, or shaders are given).
+    fn forget(&mut self, at: usize, len: usize) {
+        let end = at + len;
+        let mut kept = Vec::with_capacity(self.done.len());
+        for (s, from, to) in self.done.drain(..) {
+            if to <= at || end <= from {
+                kept.push((s, from, to));
+                continue;
+            }
+            if from < at {
+                kept.push((s.clone(), from, at));
+            }
+            if end < to {
+                kept.push((s, end, to));
+            }
+        }
+        self.done = kept;
+    }
+
+    /// local: before our write of title memory `[at, at + len)` (a
+    /// `Step::Copy`): only the pending refreshes that cover it must take the
+    /// title's data first. The others read memory the write leaves alone, so
+    /// they stay pending and merge with later ones. Flushing them all here
+    /// made ~10,000 small copies per world frame ask the kernel for the
+    /// written pages of the same big buffers ~2,000 times (a big one
+    /// ~19 times), ~600 ms of a ~1,300 ms frame.
+    fn title_written_at(&mut self, at: usize, len: usize) {
+        let end = at + len;
+        let mut i = 0;
+        while i < self.refreshes.len() {
+            let (_, from, to) = &self.refreshes[i];
+            if *from < end && at < *to {
+                let (shadow, from, to) = self.refreshes.swap_remove(i);
+                self.refresh(&shadow, from, to);
+            } else {
+                i += 1;
+            }
+        }
+        self.textures.clear();
+        self.forget(at, len);
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        for (shadow, from, to) in std::mem::take(&mut self.refreshes) {
+            self.refresh(&shadow, from, to);
         }
+    }
+
+    fn refresh(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize) {
+        let mut covered: Vec<(usize, usize)> = self
+            .done
+            .iter()
+            .filter(|(s, a, e)| std::sync::Arc::ptr_eq(s, shadow) && *a < to && from < *e)
+            .map(|&(_, a, e)| (a, e))
+            .collect();
+        covered.sort_unstable();
+        let mut at = from;
+        for (a, e) in covered {
+            if a > at {
+                Self::update(shadow, at, a);
+            }
+            at = at.max(e);
+        }
+        if at < to {
+            Self::update(shadow, at, to);
+        }
+        self.done.push((shadow.clone(), from, to));
+    }
+
+    fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let started = std::time::Instant::now();
+        let copied = shadow.update(from, to - from);
+        let us = started.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(from, to - from, us, 0);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
 }
 
@@ -1293,6 +1487,19 @@ impl Batch {
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    copy_mapped_noting(dst, src, len, title_dst, &mut |_, _| true);
+}
+
+/// [`copy_mapped`], telling `unread` each source range (address, bytes)
+/// that could not be read and was left as zeros in the destination: a host
+/// copy must not count those as copied.
+pub(crate) fn copy_mapped_noting(
+    dst: *mut u8,
+    src: *const u8,
+    len: usize,
+    title_dst: bool,
+    unread: &mut dyn FnMut(usize, usize) -> bool,
+) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -1329,13 +1536,52 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
                 let to = dst.wrapping_add(at - src as usize);
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                    {
+                        crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                        note_unread(at, n);
+                    }
+                    // local: the caller says whether the copy gets zeros
+                    // there (a first copy) or keeps what it holds (a copy
+                    // made before, which may hold what the GPU wrote).
+                    if unread(at, n) {
+                        // SAFETY: inside the destination, which is mapped.
+                        unsafe { to.write_bytes(0, n) };
+                    }
                 }
             });
         }
     });
+}
+
+/// local (diagnostics): the first title ranges a host copy could not read
+/// (left as zeros), with what the system says of the memory there and why
+/// the read failed: 64 lines in all.
+#[cfg(feature = "diagnostics")]
+fn note_unread(at: usize, n: usize) {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    static NOTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if NOTED.fetch_add(1, Ordering::Relaxed) >= 64 {
+        return;
+    }
+    // SAFETY: plain queries; the structure is filled in by the system.
+    let (error, info, got) = unsafe {
+        let error = GetLastError();
+        let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        let got = VirtualQuery(at as *const _, &mut info, size_of_val(&info));
+        (error, info, got)
+    };
+    tracing::warn!(
+        at = format_args!("{at:#x}"),
+        bytes = n,
+        error,
+        queried = got != 0,
+        state = format_args!("{:#x}", info.State),
+        protect = format_args!("{:#x}", info.Protect),
+        kind = format_args!("{:#x}", info.Type),
+        region = format_args!("{:#x}+{:#x}", info.BaseAddress as usize, info.RegionSize),
+        "host copy: title memory not readable, zeros copied (retried at the next refresh)"
+    );
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -1360,12 +1606,32 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // local: kernel32's WriteProcessMemory changes the page protection,
+    // writes, flushes the instruction cache and restores the protection on
+    // every call (~22 ms per MB here, 90% of the copy-back). The native
+    // call only writes; it fails on pages that are not writable, which take
+    // the old path.
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtWriteVirtualMemory(
+            process: *mut core::ffi::c_void,
+            base: *mut core::ffi::c_void,
+            buffer: *const core::ffi::c_void,
+            size: usize,
+            written: *mut usize,
+        ) -> i32;
+    }
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+        unsafe {
+            if NtWriteVirtualMemory(GetCurrentProcess() as _, at as _, from.cast(), n, &mut done) >= 0 && done == n {
+                return true;
+            }
+            WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0
+        }
     };
     if len == 0 || write(dst as usize, len) {
         return;
@@ -1461,6 +1727,22 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// Diagnostics (`VICTORY_PRESENT_MAGENTA`): one render target view for
+    /// the back buffer, made on first use.
+    rtv: Option<ID3D12DescriptorHeap>,
+}
+
+/// `VICTORY_PRESENT_MAGENTA`: `1` paints the whole back buffer magenta in
+/// place of the title's frame, `corner` a 128x128 square over it. If the
+/// window shows it, the copy, the swap chain and the queue work and a dark
+/// frame comes from the title's rendering, not from presenting.
+fn magenta_mode() -> Option<bool> {
+    static MODE: OnceLock<Option<bool>> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_PRESENT_MAGENTA").ok()?.as_str() {
+        "corner" => Some(false),
+        "" | "0" => None,
+        _ => Some(true),
+    })
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -1538,6 +1820,7 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                tracing::info!("{} (over {frames:.0} frames)", crate::draw::take_dynamic_stats());
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -1638,6 +1921,9 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            if let Some(whole) = magenta_mode() {
+                self.paint_magenta(&mut p.rtv, list, &back, whole, width, height, format);
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -1709,7 +1995,60 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                rtv: None,
             })
+        }
+    }
+
+    /// Clears the back buffer (in the copy destination state, left so) to
+    /// magenta: all of it or a corner square.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn paint_magenta(
+        &self,
+        rtv: &mut Option<ID3D12DescriptorHeap>,
+        list: &ID3D12GraphicsCommandList,
+        back: &ID3D12Resource,
+        whole: bool,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+    ) {
+        // SAFETY (whole function): our device, list and back buffer.
+        unsafe {
+            if rtv.is_none() {
+                let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                };
+                *rtv = self.device.CreateDescriptorHeap(&desc).ok();
+                tracing::warn!(whole, "diagnostics: presenting magenta");
+            }
+            let Some(heap) = rtv.as_ref() else { return };
+            let handle = heap.GetCPUDescriptorHandleForHeapStart();
+            let view = D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            self.device.CreateRenderTargetView(back, Some(&view), handle);
+            list.ResourceBarrier(&[transition(
+                back,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            )]);
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: if whole { width } else { width.min(128) } as i32,
+                bottom: if whole { height } else { height.min(128) } as i32,
+            };
+            list.ClearRenderTargetView(handle, &[1.0, 0.0, 1.0, 1.0], Some(&[rect]));
+            list.ResourceBarrier(&[transition(
+                back,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
         }
     }
 }

@@ -27,6 +27,39 @@ pub(crate) fn listed(n: u64) -> bool {
             .collect()
     })
     .contains(&n)
+        || n == NEXT_BUSY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `VICTORY_CAPTURE_BUSY=<draws>[,<count>]`: the frame after one that ran
+/// more than `<draws>` draws and dispatches on the host is listed too (as if
+/// named in `VICTORY_CAPTURE_FRAMES`), up to `<count>` times (default 2),
+/// every 8th frame: the world, whose frame numbers vary run to run.
+static NEXT_BUSY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// At the present of `frame`, after `ran` host draws and dispatches since
+/// the last present: lists a later frame if `VICTORY_CAPTURE_BUSY` says so.
+pub(crate) fn note_busy(frame: u64, ran: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static SETTING: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    static DONE: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let Some((draws, count)) = *SETTING.get_or_init(|| {
+        let v = std::env::var("VICTORY_CAPTURE_BUSY").ok()?;
+        let mut it = v.split(',').map(|x| x.trim().parse::<u64>().ok());
+        Some((it.next()??, it.next().flatten().unwrap_or(2)))
+    }) else {
+        return;
+    };
+    if ran > draws
+        && DONE.load(Relaxed) < count
+        && frame >= LAST.load(Relaxed) + 8
+        && NEXT_BUSY.load(Relaxed) <= frame
+    {
+        NEXT_BUSY.store(frame + 1, Relaxed);
+        LAST.store(frame + 1, Relaxed);
+        DONE.fetch_add(1, Relaxed);
+        tracing::info!(frame = frame + 1, ran, "VICTORY_CAPTURE_BUSY: capturing the next frame");
+    }
 }
 
 /// Whether frame `n` is saved.
@@ -213,10 +246,94 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// `VICTORY_SHOW_TARGET=<n>`: every frame shows the `n`th texture it
+/// rendered to or wrote (first-use order, the `<i>` of a target dump's file
+/// names) instead of what the title presents; frames with fewer targets show
+/// the title's own picture. `VICTORY_SHOW_TARGET=busiest`: the displayable
+/// target (8-bit, 10-bit or 16-bit float colour, 16:9, at least 1280 wide) the
+/// most draws wrote, which in a world frame is a G-buffer layer. A debugging
+/// view: it shows a buffer as it is (a G-buffer layer unlit, say), not a
+/// finished picture.
+#[derive(Clone, Copy)]
+pub(crate) enum Show {
+    Index(usize),
+    Busiest,
+}
+
+pub(crate) fn show_index() -> Option<Show> {
+    static N: std::sync::OnceLock<Option<Show>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let v = std::env::var("VICTORY_SHOW_TARGET").ok()?;
+        let v = v.trim();
+        let show = if v.eq_ignore_ascii_case("busiest") {
+            Show::Busiest
+        } else {
+            Show::Index(v.parse().ok()?)
+        };
+        tracing::warn!(target = v, "VICTORY_SHOW_TARGET: showing a render target instead of the title's picture");
+        Some(show)
+    })
+}
+
+/// Draws that wrote each noted target this frame (show mode `busiest`).
+static HITS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// At the present of `frame` in show mode: the noted target to show, if the
+/// frame has one. Clears the frame's list unless a dump still needs it.
+pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+    let show = show_index()?;
+    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
+    if frame.is_power_of_two() && frame >= 256 {
+        let list: Vec<String> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, (r, c))| {
+                // SAFETY: a live resource.
+                let d = unsafe { c.texture.GetDesc() };
+                let n = hits.iter().find(|h| h.0 == *r).map_or(0, |h| h.1);
+                format!("{i}: {}x{} f{} ({n} draws)", d.Width, d.Height, d.Format.0)
+            })
+            .collect();
+        tracing::info!(frame, ?list, "VICTORY_SHOW_TARGET: this frame's targets");
+    }
+    let pick = match show {
+        Show::Index(n) => targets.get(n).map(|(_, c)| c.clone()),
+        Show::Busiest => targets
+            .iter()
+            .filter(|(_, c)| {
+                // SAFETY: a live resource.
+                let d = unsafe { c.texture.GetDesc() };
+                d.Width >= 1280
+                    // Screen-shaped (16:9): not a shadow map, which more draws write.
+                    && d.Width * 9 == u64::from(d.Height) * 16
+                    && matches!(d.Format.0, 9..=14 | 23..=25 | 27..=32 | 87 | 90 | 91)
+            })
+            .max_by_key(|(r, _)| hits.iter().find(|h| h.0 == *r).map_or(0, |h| h.1))
+            .map(|(_, c)| c.clone()),
+    };
+    if !(dump_on() && listed(frame)) {
+        targets.clear();
+    }
+    hits.clear();
+    pick
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() {
         return;
+    }
+    let dumping = dump_on() && listed(crate::queue::presented() + 1);
+    if !dumping && show_index().is_none() {
+        return;
+    }
+    if show_index().is_some() {
+        let mut hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
+        match hits.iter_mut().find(|h| h.0 == resource as usize) {
+            Some(h) => h.1 += 1,
+            None => hits.push((resource as usize, 1)),
+        }
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     if !targets.iter().any(|&(r, _)| r == resource as usize)
@@ -226,9 +343,228 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
 }
 
+/// local: indirect executions sampled in a listed frame: label, kind, title
+/// address of the records, read-back buffer (records, then the count's
+/// dword if any), stride, records, count, and whether the list ran.
+struct IndirectSample {
+    label: String,
+    kind: u32,
+    arguments: u64,
+    buffer: ID3D12Resource,
+    stride: u32,
+    records: u32,
+    counted: bool,
+    /// Set once the list's submission ran and was copied back; the list
+    /// holds the other reference until it is reset.
+    ran: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for IndirectSample {}
+static INDIRECT: std::sync::Mutex<Vec<IndirectSample>> = std::sync::Mutex::new(Vec::new());
+
+/// Totals of the samples logged since the last summary.
+#[derive(Default)]
+struct IndirectTotals {
+    executions: u64,
+    records: u64,
+    empty: u64,
+    flat: u64,
+    work: u64,
+    never_ran: u64,
+}
+static TOTALS: std::sync::Mutex<IndirectTotals> = std::sync::Mutex::new(IndirectTotals {
+    executions: 0,
+    records: 0,
+    empty: 0,
+    flat: 0,
+    work: 0,
+    never_ran: 0,
+});
+
+/// local (diagnostics): records, in `list`, a copy of the arguments an
+/// indirect execution of `kind` at title address `arguments` just read
+/// (`args`: buffer in the indirect-argument state, offset, stride, records)
+/// and of its count (`count`: buffer, offset, whether it was moved to the
+/// indirect-argument state), logged once the list's submission has run (a
+/// sample read before that holds the read-back buffer's zeros, not what
+/// the GPU read). At most 4 KiB of records each.
+pub(crate) fn sample_indirect(
+    list: &crate::host::HostList,
+    label: String,
+    (kind, arguments): (u32, u64),
+    (buffer, offset, stride, records): (&ID3D12Resource, u64, u32, u32),
+    count: Option<(&ID3D12Resource, u64, bool)>,
+) {
+    let Some(host) = crate::host::host() else { return };
+    let records = records.min(4096 / stride.max(4)).max(1);
+    let bytes = u64::from(stride) * u64::from(records);
+    let total = bytes + 4;
+    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: total,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut back: Option<ID3D12Resource> = None;
+    // SAFETY: plain buffer creation on our device.
+    let made = unsafe {
+        host.device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut back,
+        )
+    };
+    let (Ok(()), Some(back)) = (made, back) else {
+        tracing::warn!(label, "indirect sample: no read-back buffer");
+        return;
+    };
+    // The list's copy writes it: alive until the list is reset, whenever
+    // the sample is logged (freed at the present before the list ran, the
+    // copy wrote freed memory and the device was removed, run cf33).
+    list.keep(&back);
+    let arg_state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    let src = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    // SAFETY: an open list; live buffers the list keeps; the copy stays
+    // inside both (the arguments' range was found inside their buffer).
+    unsafe {
+        let l = &list.list;
+        l.ResourceBarrier(&[crate::host::transition(buffer, arg_state, src)]);
+        l.CopyBufferRegion(&back, 0, buffer, offset, bytes);
+        l.ResourceBarrier(&[crate::host::transition(buffer, src, arg_state)]);
+        if let Some((c, at, moved)) = count {
+            let same = c == buffer;
+            let before = if moved || same { arg_state } else { D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+            l.ResourceBarrier(&[crate::host::transition(c, before, src)]);
+            l.CopyBufferRegion(&back, bytes, c, at, 4);
+            l.ResourceBarrier(&[crate::host::transition(c, src, before)]);
+        }
+    }
+    let ran = list.ran_flag();
+    INDIRECT.lock().unwrap_or_else(|e| e.into_inner()).push(IndirectSample {
+        label,
+        kind,
+        arguments,
+        buffer: back,
+        stride,
+        records,
+        counted: count.is_some(),
+        ran,
+    });
+}
+
+/// local (diagnostics): logs the sampled indirect executions whose lists
+/// have run (called after each submission's copy-back), and drops, counted,
+/// those whose list was reset without running. A summary follows once
+/// none is left waiting.
+pub(crate) fn drain_indirect() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (ready, waiting) = {
+        let mut samples = INDIRECT.lock().unwrap_or_else(|e| e.into_inner());
+        if samples.is_empty() {
+            return;
+        }
+        let all = std::mem::take(&mut *samples);
+        let (ready, rest): (Vec<_>, Vec<_>) = all
+            .into_iter()
+            .partition(|s| s.ran.load(Relaxed) || std::sync::Arc::strong_count(&s.ran) == 1);
+        *samples = rest;
+        (ready, samples.len())
+    };
+    let mut totals = TOTALS.lock().unwrap_or_else(|e| e.into_inner());
+    for s in &ready {
+        if !s.ran.load(Relaxed) {
+            totals.never_ran += 1;
+            continue;
+        }
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the list ran and was waited for; the mapping spans the
+        // buffer.
+        let words: Vec<u32> = unsafe {
+            if s.buffer.Map(0, None, Some(&mut data)).is_err() {
+                tracing::warn!(what = %s.label, "indirect sample: read-back buffer not mapped");
+                continue;
+            }
+            let n = (s.stride as usize * s.records as usize + 4) / 4;
+            let w = std::slice::from_raw_parts(data.cast::<u32>(), n).to_vec();
+            s.buffer.Unmap(0, None);
+            w
+        };
+        // Title memory now, after the copy-back: what the title will see.
+        let mut bytes = [0u8; 12];
+        let after = crate::host::read_into(s.arguments as *const u8, &mut bytes)
+            .then(|| [0, 4, 8].map(|i| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]])));
+        let per = s.stride as usize / 4;
+        let count = if s.counted { words[s.records as usize * per] } else { s.records };
+        let used = count.min(s.records) as usize;
+        let mut shown = Vec::new();
+        let mut g_here = 0u64;
+        // Draws: vertex or index count times instances (the third word is
+        // where they start); dispatches: the groups.
+        let dispatch = matches!(s.kind, 2 | 10);
+        let factors = if dispatch { 3 } else { 2 };
+        for r in 0..used {
+            let rec = &words[r * per..(r * per + per.min(4))];
+            let g = rec.iter().take(factors).map(|&v| u64::from(v)).product::<u64>();
+            if dispatch && rec.len() >= 3 && (rec[1] == 0 || rec[2] == 0) && rec[0] != 0 {
+                totals.flat += 1;
+            }
+            if g == 0 {
+                totals.empty += 1;
+            }
+            g_here += g;
+            totals.records += 1;
+            if shown.len() < 4 {
+                shown.push(format!("{rec:?}"));
+            }
+        }
+        totals.work += g_here;
+        totals.executions += 1;
+        tracing::info!(
+            what = %s.label,
+            count,
+            counted = s.counted,
+            work = g_here,
+            ran = %shown.join(" "),
+            title_after = ?after,
+            "indirect sample (what the GPU read, after its list ran)"
+        );
+    }
+    if waiting == 0 && (totals.executions > 0 || totals.never_ran > 0) {
+        let t = std::mem::take(&mut *totals);
+        tracing::info!(
+            executions = t.executions,
+            records = t.records,
+            empty_records = t.empty,
+            x_without_y_or_z = t.flat,
+            work_sum = t.work,
+            never_ran = t.never_ran,
+            "indirect samples: summary"
+        );
+    }
+}
+
+/// local (diagnostics): at the present of a listed frame, logs what of its
+/// samples has run; the rest is logged after its submission.
+fn dump_indirect(frame: u64) {
+    let waiting = INDIRECT.lock().unwrap_or_else(|e| e.into_inner()).len();
+    if waiting > 0 {
+        tracing::info!(frame, waiting, "indirect samples: lists not run yet at the present");
+    }
+    drain_indirect();
+}
+
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    dump_indirect(frame);
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {

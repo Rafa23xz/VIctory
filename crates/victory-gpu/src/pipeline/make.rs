@@ -60,8 +60,22 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            // local: a translator panic must not kill the worker thread (and
+            // leave this pipeline "being made" forever): no host pipeline.
+            let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            }));
+            made.unwrap_or_else(|e| {
+                let why = e
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| e.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                tracing::warn!(shaders = ?self.shaders, panic = %why, "host pipeline panicked; its draws are dropped");
+                None
+            })
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
