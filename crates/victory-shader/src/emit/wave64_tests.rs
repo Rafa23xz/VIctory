@@ -345,6 +345,80 @@ fn divergent_early_return_taints_subsequent_blocks() {
     }
 }
 
+/// `if (tid < 32) { v1 = s4 + 3; v2 = s4 < v1 ? v1 : 0; s5 = readfirstlane(v2); v3 = s5 } store(v3)`
+/// with `s4 = 7`: every lane computes `v2` from the same scalar, so the read is
+/// `v2` itself (10) whatever the host wave width, inside divergent flow too.
+/// `read` replaces what `v_readfirstlane_b32` reads (`None`: `v2`).
+fn uniform_readfirstlane_program(read: Option<&[u32]>) -> NativeProgram {
+    let mut code = vec![
+        s_mov_b32(4, inline_u(7)),
+        v_mov_b32(3, inline_u(0)),
+        v_cmp_gt_u32(inline_u(32), 0), // vcc = 32 > tid
+        s_and_saveexec_b64(6, VCC),
+    ];
+    let br_idx = code.len();
+    code.push(0); // s_cbranch_execz -> after
+    code.push(v_mov_b32(1, 4)); // v1 = s4
+    code.push(v_add_nc_u32(1, inline_u(3), 1)); // v1 = 3 + v1
+    code.push(v_cmp_lt_u32(4, 1)); // vcc = s4 < v1: the same bit in every lane
+    code.extend_from_slice(&v_cndmask_b32(2, inline_u(0), vgpr(1), VCC)); // v2 = vcc ? v1 : 0
+    match read {
+        Some(words) => code.extend_from_slice(words),
+        None => code.push(v_readfirstlane_b32(5, 2)),
+    }
+    code.push(v_mov_b32(3, 5)); // v3 = s5
+    let after = code.len();
+    code[br_idx] = s_cbranch_execz((after - (br_idx + 1)) as i16);
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+    emit_uav_store(&mut code, 3, 0);
+    code.push(S_ENDPGM);
+    make_cs_program(&code, [128, 1, 1], 0, false)
+}
+
+fn uses_wave_read_lane_first(shader: &HostShader) -> bool {
+    shader.dxil.windows(17).any(|w| w == b"waveReadLaneFirst")
+}
+
+#[test]
+fn uniform_readfirstlane_in_divergent_flow_is_the_value_itself() {
+    let prog = uniform_readfirstlane_program(None);
+    for mode in [Wave64Mode::Native, Wave64Mode::Wave32, Wave64Mode::Emulate] {
+        let shader = emit_cs(&prog, mode).unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+        assert!(!uses_wave_read_lane_first(&shader), "{mode:?}: no wave read needed");
+        // Nothing in it depends on the lane layout: no emulation, no wave size.
+        if mode == Wave64Mode::Wave32 {
+            assert_eq!(psv_wave_range(&shader), (0, u32::MAX), "{mode:?}");
+        }
+    }
+}
+
+#[test]
+fn readfirstlane_of_a_lane_varying_value_still_needs_the_console_wave() {
+    // The thread id differs per lane: the first active console lane decides,
+    // which the emulated read cannot do inside divergent flow.
+    let tid = [v_readfirstlane_b32(5, 0)];
+    let prog = uniform_readfirstlane_program(Some(&tid));
+    for mode in [Wave64Mode::Wave32, Wave64Mode::Emulate] {
+        let err = emit_cs(&prog, mode).unwrap_err();
+        assert!(
+            matches!(err, ShaderError::Unsupported { what, .. } if what.contains("readfirstlane")),
+            "{mode:?}: got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn a_mask_read_as_a_number_is_not_the_same_in_every_lane() {
+    // v4 = vcc_lo spells out which lanes are active: a select may use vcc's
+    // bit, but its number is not uniform data.
+    let words = [v_mov_b32(4, VCC), v_readfirstlane_b32(5, 4)];
+    let prog = uniform_readfirstlane_program(Some(&words));
+    for mode in [Wave64Mode::Wave32, Wave64Mode::Emulate] {
+        let err = emit_cs(&prog, mode).unwrap_err();
+        assert!(matches!(err, ShaderError::Unsupported { .. }), "{mode:?}: got {err:?}");
+    }
+}
+
 #[test]
 fn translate_with_handles_synthetic_wave64_container() {
     // Build genuine DXBC + XDAT(XBCH(FSSM)) Wave64 compute container with ResourceHeap param.
@@ -907,5 +981,14 @@ mod gpu {
             &expected,
             true,
         );
+    }
+
+    #[test]
+    fn gpu_128_threads_uniform_readfirstlane_in_divergent_flow() {
+        // Threads 0..31 read 10 (7 + 3, selected by a compare of the same
+        // values); the others keep 0. Before, Wave32 and Emulate refused it.
+        let prog = uniform_readfirstlane_program(None);
+        let expected: Vec<u32> = (0..128u32).map(|t| if t < 32 { 10 } else { 0 }).collect();
+        run_on_hosts("uniform_readfirstlane", &prog, [1, 1, 1], 128, &expected, false);
     }
 }

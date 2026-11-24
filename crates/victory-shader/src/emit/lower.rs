@@ -198,6 +198,9 @@ struct Lower<'a> {
     uniform: Vec<bool>,
     /// Per IR value: conservatively true only for group-uniform scalars.
     val_uniform: Vec<bool>,
+    /// Per IR value: the same in every lane that computes it ([`data_uniformity`]).
+    /// Filled only when 64-lane waves are mapped onto other host waves.
+    data_uniform: Vec<bool>,
     /// Entry-block `(flat_tid, console_lane, vwave)` cached when emulating Wave64.
     wave_ids: Option<(V, V, V)>,
     /// Active `begin_guarded` nesting depth (never emit barriers while > 0).
@@ -649,6 +652,127 @@ fn compute_uniformity(
     (blocks, val_uniform)
 }
 
+/// Per IR value: whether every lane that computes it gets the same value,
+/// whatever block it is in. Wider than [`compute_uniformity`]'s values, which
+/// also need every thread of the group to arrive together.
+///
+/// A value qualifies when it is group-uniform already, or is written by
+///
+/// * a scalar instruction reading only such values (as there), or
+/// * a vector instruction that every lane reaching it executes (no guard:
+///   EXEC holds there, so no lane keeps the destination's old value), that
+///   reads no other lane, keeps no old destination bits (no SDWA, no
+///   high-half destination, no 16-bit results, no accumulating `mac`/`dot`
+///   forms), and whose explicit operands are all such values or constants.
+///
+/// The vector instruction's implicit reads of EXEC and of its destination's
+/// old value are what [`compute_uniformity`] cannot see past; here they do not
+/// matter, because every lane that reaches the instruction writes the
+/// destination from the same operands. Phis keep their group-uniform state:
+/// lanes joining from different paths may bring different values.
+///
+/// One lane mask role counts too: the selector of `v_cndmask_b32`. A compare
+/// (`v_cmp_*`, not `v_cmpx_*`) with the same conditions on its operands gives
+/// every lane computing it the same bit, so a select on it picks alike in every
+/// lane. Such masks are tracked apart and accepted only there: read as a
+/// number (`v_mov_b32 v0, vcc_lo`, any scalar instruction) a mask spells out
+/// which lanes are active, which is not the same everywhere.
+///
+/// This is what makes `v_readfirstlane_b32 s, v` exact as `v` itself, at any
+/// host wave size: the compiler emits it to move a value the console knows to
+/// be wave-uniform into an SGPR (an unsigned division by a scalar computes its
+/// reciprocal in a VGPR and reads it back this way).
+fn data_uniformity(p: &Program, st: &Structured, val_uniform: &[bool]) -> Vec<bool> {
+    let mut du = val_uniform.to_vec();
+    // Lane masks whose bit is the same in every lane that computes them.
+    let mut bools: HashSet<Value> = HashSet::new();
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let ok = |du: &[bool], v: Option<Value>| v.is_some_and(|v| du.get(v.0 as usize).copied().unwrap_or(false));
+    loop {
+        let mut changed = false;
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (ii, inst) in block.insts.iter().enumerate() {
+                let name = inst.name();
+                let unguarded = st.guards.get(b).and_then(|g| g.get(ii)).is_some_and(Option::is_none);
+                // Explicit operands of a vector instruction, all the same in
+                // every lane; `select` is the operand index read as a lane bit.
+                let operands_alike = |du: &[bool], bools: &HashSet<Value>, v: &crate::gfx10::Valu, select: Option<usize>| {
+                    v.src.iter().enumerate().all(|(k, op)| match *op {
+                        Operand::Const(c) => c < 251, // not vccz/execz/scc/lds_direct
+                        Operand::Literal(_) => true,
+                        Operand::Scalar { code, dwords } => (code..code.saturating_add(dwords.max(1))).all(|r| {
+                            let val = inst.read(Reg::S(r));
+                            ok(du, val) || (select == Some(k) && val.is_some_and(|v| bools.contains(&v)))
+                        }),
+                        Operand::Vector { reg, dwords } => {
+                            (reg..reg.saturating_add(dwords.max(1))).all(|r| ok(du, inst.read(Reg::V(r))))
+                        }
+                        _ => false,
+                    })
+                };
+                if let Fields::Valu(v) = &inst.fields
+                    && name.starts_with("v_cmp_")
+                    && unguarded
+                    && v.dpp.is_none()
+                    && v.sdwa.is_none()
+                    && !name.contains("16")
+                    && operands_alike(&du, &bools, v, None)
+                {
+                    for &(_, w) in &inst.writes {
+                        changed |= is_mask(w) && bools.insert(w);
+                    }
+                    continue;
+                }
+                if inst.writes.is_empty()
+                    || inst.writes.iter().all(|&(_, w)| du.get(w.0 as usize).copied().unwrap_or(true))
+                    || inst.writes.iter().any(|&(_, w)| is_mask(w))
+                {
+                    continue;
+                }
+                let qualifies = match &inst.fields {
+                    Fields::Sop { .. } | Fields::Smem { .. } => {
+                        !name.starts_with("s_getreg")
+                            && !name.starts_with("s_bcnt")
+                            && !name.starts_with("s_ff1")
+                            && !name.contains("saveexec")
+                            && !name.starts_with("s_memtime")
+                            && !name.starts_with("s_memrealtime")
+                            && inst.reads.iter().all(|&(_, v)| ok(&du, Some(v)))
+                    }
+                    Fields::Valu(v) => {
+                        let lane_free = !(name.contains("lane") && name != "v_readfirstlane_b32")
+                            && !name.contains("mbcnt")
+                            && !name.contains("movrel")
+                            && !name.contains("swaprel")
+                            && !name.contains("mac")
+                            && !name.starts_with("v_dot")
+                            && !name.contains("16")
+                            && !name.contains("interp");
+                        let keeps_nothing = v.dpp.is_none() && v.sdwa.is_none() && v.opsel & 8 == 0;
+                        // The selector is the last source (VOP2's implicit VCC, VOP3's src2).
+                        let select = (name == "v_cndmask_b32").then(|| v.src.len().saturating_sub(1));
+                        lane_free && keeps_nothing && unguarded && operands_alike(&du, &bools, v, select)
+                    }
+                    _ => false,
+                };
+                if qualifies {
+                    for &(_, w) in &inst.writes {
+                        if let Some(u) = du.get_mut(w.0 as usize)
+                            && !*u
+                        {
+                            *u = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            return du;
+        }
+    }
+}
+
 /// Masks read as data in a block other than their defining block, keyed by defining block (`None` = entry).
 fn collect_cross_block_masks(
     p: &Program,
@@ -743,6 +867,7 @@ impl<'a> Lower<'a> {
         let mut spills = HashMap::new();
         let mut uniform = Vec::new();
         let mut val_uniform = Vec::new();
+        let mut data_uniform = Vec::new();
         let mut cross_block_masks = HashMap::new();
 
         if let StageIo::Cs(cs) = x.native.io {
@@ -811,13 +936,16 @@ impl<'a> Lower<'a> {
                 Wave64Mode::Wave32 | Wave64Mode::Emulate => {
                     spills = spilled_sgprs(p);
                     (uniform, val_uniform) = compute_uniformity(p, x.st, x.res, &x.io.inputs);
+                    data_uniform = data_uniformity(p, x.st, &val_uniform);
+                    // A read of a value every lane holds alike is that value
+                    // (see the `v_readfirstlane_b32` lowering): no emulation.
                     let has_non_uniform_firstlane = insts().any(|i| {
                         i.name() == "v_readfirstlane_b32"
                             && matches!(
                                 &i.fields,
                                 Fields::Valu(v)
                                     if matches!(v.src.first(), Some(Operand::Vector { reg, .. })
-                                        if i.read(Reg::V(*reg)).is_some_and(|val| !val_uniform[val.0 as usize]))
+                                        if i.read(Reg::V(*reg)).is_some_and(|val| !data_uniform[val.0 as usize]))
                             )
                     });
                     let has_unresolved_readlane = p.blocks.iter().enumerate().any(|(b, blk)| {
@@ -983,6 +1111,7 @@ impl<'a> Lower<'a> {
             spills,
             uniform,
             val_uniform,
+            data_uniform,
             wave_ids: None,
             guard_depth: 0,
             cross_block_masks,
@@ -5258,6 +5387,18 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
+                // Every lane holds the same value: the first active lane's is
+                // each lane's own, on a console wave of any width and in any
+                // control flow, so no wave operation (or emulation) is needed.
+                let same_everywhere = v.src.first().is_some_and(|op| match *op {
+                    Operand::Vector { reg, .. } => inst.read(Reg::V(reg)).is_some_and(|val| {
+                        self.data_uniform.get(val.0 as usize).copied().unwrap_or(false)
+                    }),
+                    _ => false,
+                });
+                if same_everywhere {
+                    return int(self, a);
+                }
                 let non_uniform = v.src.first().is_some_and(|op| match *op {
                     Operand::Vector { reg, .. } => inst.read(Reg::V(reg)).is_some_and(|val| {
                         !self
