@@ -1,0 +1,21 @@
+[package]
+name = "shader-census"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+description = "One JSONL record per native program, every victory-shader stage measured on its own"
+
+# Not a member of the VIctory workspace: build it from this folder.
+[workspace]
+
+[dependencies]
+victory-shader = { path = "../../crates/victory-shader", features = ["host"] }
+victory-game = { path = "../../crates/victory-game" }
+blake3 = "1"
+memchr = "2"
+serde_json = "1"
+
+[profile.release]
+debug = 1
+panic = "unwind"
