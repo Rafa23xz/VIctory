@@ -61,6 +61,52 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
+/// A host resource waiting to be dropped after in-flight GPU work finishes.
+struct Retired {
+    frame: u64,
+    #[allow(dead_code)]
+    resource: ID3D12Resource,
+}
+
+// SAFETY: D3D12 resources are free-threaded and may be released on any thread.
+unsafe impl Send for Retired {}
+
+/// Host resources retired on worker threads (for example when a descriptor
+/// slot is overwritten or a title resource is released while a submission is
+/// executing on the GPU). Kept alive for several presented frames because a
+/// single title frame spans many submissions and worker threads may record
+/// lists ahead of presentation.
+static RETIRED: Mutex<Vec<Retired>> = Mutex::new(Vec::new());
+
+/// Holds `resource` alive until several full frames have completed on the GPU.
+pub(crate) fn retire(resource: ID3D12Resource) {
+    let frame = crate::queue::presented();
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Retired { frame, resource });
+}
+
+/// Ages are in frames presented to the host (not the title's 60 Hz clock, which
+/// ticks many times per frame while the host runs at 1-2 fps).
+/// Takes retired resources old enough to drop once the current submission
+/// finishes on the GPU.
+fn take_retired() -> Vec<Retired> {
+    const KEEP_FRAMES: u64 = 4;
+    let now = crate::queue::presented();
+    let mut guard = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ready = Vec::new();
+    let mut i = 0;
+    while i < guard.len() {
+        if now.saturating_sub(guard[i].frame) >= KEEP_FRAMES {
+            ready.push(guard.swap_remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    ready
+}
+
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
@@ -208,6 +254,9 @@ fn create() -> windows::core::Result<Host> {
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         tracing::info!("host D3D12 device ready");
+        let wave64_mode = recommended_wave64_mode(&device);
+        crate::shader_cache::set_wave64_mode(wave64_mode);
+        tracing::info!(?wave64_mode, "Wave64 compute lowering mode selected");
         Ok(Host {
             device,
             queue,
@@ -223,6 +272,31 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+/// Queries D3D12 wave lane capabilities and chooses the Wave64 lowering mode.
+fn recommended_wave64_mode(device: &ID3D12Device) -> victory_shader::emit::Wave64Mode {
+    use victory_shader::emit::Wave64Mode;
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: plain D3D12 feature query with valid struct size.
+    let ok = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut opts).cast(),
+            size_of_val(&opts) as u32,
+        )
+    }
+    .is_ok();
+    if !ok || !opts.WaveOps.as_bool() {
+        return Wave64Mode::Emulate;
+    }
+    if opts.WaveLaneCountMin <= 64 && opts.WaveLaneCountMax >= 64 {
+        Wave64Mode::Native
+    } else if opts.WaveLaneCountMin <= 32 && opts.WaveLaneCountMax >= 32 {
+        Wave64Mode::Wave32
+    } else {
+        Wave64Mode::Emulate
     }
 }
 
@@ -508,6 +582,7 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        let retired = take_retired();
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -572,6 +647,7 @@ impl Host {
                 last_notes(runs)
             ));
         }
+        drop(retired);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -756,6 +832,17 @@ impl Host {
         unsafe {
             let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
             handle.ptr += (slot * self.rtv_size) as usize;
+            let d = resource.GetDesc();
+            if d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0 {
+                let null_desc = D3D12_RENDER_TARGET_VIEW_DESC {
+                    Format: desc.map_or(DXGI_FORMAT_R8G8B8A8_UNORM, |x| x.Format),
+                    ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                    ..Default::default()
+                };
+                self.device
+                    .CreateRenderTargetView(None::<&ID3D12Resource>, Some(&null_desc), handle);
+                return handle;
+            }
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
             handle
@@ -1358,12 +1445,32 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // local: kernel32's WriteProcessMemory changes the page protection,
+    // writes, flushes the instruction cache and restores the protection on
+    // every call (~22 ms per MB here, 90% of the copy-back). The native
+    // call only writes; it fails on pages that are not writable, which take
+    // the old path.
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtWriteVirtualMemory(
+            process: *mut core::ffi::c_void,
+            base: *mut core::ffi::c_void,
+            buffer: *const core::ffi::c_void,
+            size: usize,
+            written: *mut usize,
+        ) -> i32;
+    }
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+        unsafe {
+            if NtWriteVirtualMemory(GetCurrentProcess() as _, at as _, from.cast(), n, &mut done) >= 0 && done == n {
+                return true;
+            }
+            WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0
+        }
     };
     if len == 0 || write(dst as usize, len) {
         return;

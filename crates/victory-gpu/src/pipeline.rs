@@ -116,12 +116,23 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                    }
+                }
+                // local: `VICTORY_DUMP_SHADERS=dir` keeps the containers
+                // (all of them with `VICTORY_DUMP_ALL=1`, else the ones that
+                // do not translate), for offline study.
+                if let Some(dir) = std::env::var_os("VICTORY_DUMP_SHADERS")
+                    && (done.is_err() || std::env::var_os("VICTORY_DUMP_ALL").is_some())
+                {
+                    let file = std::path::Path::new(&dir).join(format!("{}.dxbc", self.hash));
+                    let _ = std::fs::write(file, &self.container);
                 }
                 done.ok()
             })
@@ -240,6 +251,20 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
     });
+    // local: VICTORY_SKIP_STAGES=mesh[,compute,...] skips every pipeline
+    // with a shader of those stages.
+    static STAGES: OnceLock<Vec<String>> = OnceLock::new();
+    let stages = STAGES.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_STAGES")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    if let Some(shader) = p.shaders.iter().find(|s| stages.iter().any(|st| st == &s.stage.to_ascii_lowercase())) {
+        return Some(shader.hash.as_str());
+    }
     if hashes.is_empty() {
         return None;
     }

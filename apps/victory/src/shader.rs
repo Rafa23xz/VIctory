@@ -83,7 +83,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 continue;
             }
             let path = entry.path();
-            if entry.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE {
+            if entry.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE
+                && std::env::var_os("VICTORY_FIND").is_none()
+            {
                 eprintln!("skipping large file {}", path.display());
                 continue;
             }
@@ -99,6 +101,19 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 let Ok(container) = Container::parse(&bytes) else {
                     continue;
                 };
+                // local: `VICTORY_FIND=hash,...` (16-digit hashes as the
+                // runtime logs them) saves those containers in
+                // `VICTORY_FIND_OUT` (default `.`) as `<hash>.dxbc`.
+                if let Ok(find) = std::env::var("VICTORY_FIND") {
+                    let total = u32::from_le_bytes(bytes[0x18..0x1c].try_into().unwrap()) as usize;
+                    let hash = blake3::hash(&bytes[..total]).to_hex();
+                    if find.split(',').any(|h| !h.is_empty() && hash.starts_with(h.trim())) {
+                        let out = std::env::var("VICTORY_FIND_OUT").unwrap_or_else(|_| ".".into());
+                        let file = format!("{out}/{}.dxbc", &hash[..16]);
+                        let _ = std::fs::write(&file, &bytes[..total]);
+                        eprintln!("found {} in {}{}", &hash[..16], path.display(), source.label());
+                    }
+                }
                 found_here += 1;
                 t.containers += 1;
                 let dxil = container.part(FourCC::DXIL);

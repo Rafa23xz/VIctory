@@ -1137,6 +1137,14 @@ mod host {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
+            // VICTORY_KEYBOARD_PAD=1: ignore host pads (a virtual pad such as a
+            // streaming or remapper driver would otherwise turn the keyboard's
+            // stand-in pad off).
+            static KEYBOARD_ONLY: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| std::env::var_os("VICTORY_KEYBOARD_PAD").is_some_and(|v| v == "1"));
+            if *KEYBOARD_ONLY {
+                return None;
+            }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {

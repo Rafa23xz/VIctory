@@ -1,4 +1,4 @@
-//! Host copies of title buffers (decision 0007, step 3 and "Copies of title
+﻿//! Host copies of title buffers (decision 0007, step 3 and "Copies of title
 //! memory"). Title buffers are title memory, which the host GPU cannot
 //! read, so a buffer a draw uses gets a persistent host buffer of its size
 //! on first use (system memory shaders may also write), and the ranges each
@@ -149,35 +149,51 @@ impl Shadow {
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
     /// ~2.3 million page faults per world frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
         let (from, to) = self.inside(address, len);
+        // The parts no earlier range of the submission declared: their
+        // refresh was free to bring the title's bytes into the copy (a
+        // refresh leaves declared ranges alone), and may just have.
+        let fresh = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let declared = pending.iter().map(|&(a, e)| self.inside(a, e - a));
+            let fresh = outside(from, to, declared.collect());
+            pending.push((address, address + len));
+            fresh
+        };
         // SAFETY: inside the mapping.
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
+        let old = match &*before {
+            Some((at, bytes)) => (*at, at + bytes.len()),
+            None => (from, from),
         };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
-        {
-            return;
-        }
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
+        let (start, end) = (old.0.min(from), old.1.max(to));
+        if (start, end) != old {
+            // Parts newly covered from the copy, the rest as it was taken.
+            let mut grown = pooled(end - start);
+            match before.take() {
+                Some((at, bytes)) => {
+                    grown.extend_from_slice(host(start, at));
+                    grown.extend_from_slice(&bytes);
+                    grown.extend_from_slice(host(at + bytes.len(), end));
+                    give_back(bytes);
+                }
+                None => grown.extend_from_slice(host(start, end)),
             }
-            None => grown.extend_from_slice(host(start, end)),
+            *before = Some((start, grown));
         }
-        *before = Some((start, grown));
+        // What the snapshot already held of the fresh parts (it spans the
+        // gaps between the ranges declared so far) was taken before their
+        // refresh: taken again, or the refresh would pass for a shader's
+        // write and go back over what the title writes meanwhile.
+        if let Some((at, bytes)) = &mut *before {
+            for (a, e) in fresh {
+                let (a, e) = (a.max(old.0), e.min(old.1));
+                if a < e {
+                    bytes[a - *at..e - *at].copy_from_slice(host(a, e));
+                }
+            }
+        }
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -192,28 +208,45 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
+        if let Some((taken, before)) = &mut *snapshot
             && *taken <= from
-            && to <= taken + before.len()
+            && to <= *taken + before.len()
             && from < to
         {
-            let before = &before[from - taken..to - taken];
+            let before = &mut before[from - *taken..to - *taken];
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
             let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
             let mut at = from;
+            let t0 = std::time::Instant::now();
+            let mut t_cmp = std::time::Duration::ZERO;
+            let mut t_read = std::time::Duration::ZERO;
+            let mut t_merge = std::time::Duration::ZERO;
+            let mut t_write = std::time::Duration::ZERO;
+            let mut t_watch = std::time::Duration::ZERO;
+            let mut pieces_changed = 0u64;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let old = &mut before[at - from..at - from + n];
                 let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                let tc = std::time::Instant::now();
+                let differs = host != old;
+                t_cmp += tc.elapsed();
+                let tr = std::time::Instant::now();
+                let read_ok = differs && crate::host::read_into((start + at) as *const u8, title);
+                t_read += tr.elapsed();
+                if read_ok {
+                    pieces_changed += 1;
+                    let tm = std::time::Instant::now();
                     // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
+                    // takes the title's bytes in turn, and so does the
+                    // snapshot: to a later range that overlaps this one,
+                    // they are not a shader's write to put back.
                     let mut changed = false;
                     for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
                         if *h != *o && *t != *h {
@@ -221,16 +254,27 @@ impl Shadow {
                             changed = true;
                         }
                         *h = *t;
+                        *o = *t;
                     }
+                    t_merge += tm.elapsed();
                     if changed {
+                        let tw = std::time::Instant::now();
                         crate::watch::writing(start + at, n);
+                        t_watch += tw.elapsed();
+                        let tw = std::time::Instant::now();
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        t_write += tw.elapsed();
                         written += n;
                     }
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
             }
+            back_profile::add(
+                (to - from) as u64,
+                pieces_changed,
+                [t0.elapsed(), t_cmp, t_read + t_watch, t_merge, t_write],
+            );
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
@@ -277,10 +321,46 @@ impl Shadow {
             .filter(|&(a, e)| a < to && e > from)
             .collect();
         if !busy.is_empty() {
+            busy.sort_unstable();
+            // local: one write-watch asking for the whole range, the gaps
+            // copied from its answer. Asking per gap made dozens of system
+            // calls per buffer and submission (~5,000-6,000 per world frame,
+            // 0.2-1.6 s with the title's threads faulting pages meanwhile);
+            // the journal keeps what the asking found in the busy parts.
+            if grouped_watch()
+                && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
+                && let Some((now, written)) = crate::watch::writes(from, to, true)
+            {
+                self.watched.store(1, Ordering::Relaxed);
+                let (mut at, mut bytes) = (from, 0);
+                let mut gaps = Vec::new();
+                for &(a, e) in &busy {
+                    if a > at {
+                        gaps.push((at, a.min(to)));
+                    }
+                    at = at.max(e);
+                }
+                if at < to {
+                    gaps.push((at, to));
+                }
+                for (a, e) in gaps {
+                    let (p0, p1) = (a / PAGE, (e - 1) / PAGE);
+                    let lo = written.partition_point(|&(p, _)| p < p0);
+                    let hi = written.partition_point(|&(p, _)| p <= p1);
+                    let copied = self.copy_stale(a, e, now, &written[lo..hi]);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use crate::copystat::{C, add};
+                        add(C::Checked, (e - a) as u64);
+                        add(C::Unchanged, (e - a).saturating_sub(copied) as u64);
+                    }
+                    bytes += copied;
+                }
+                return bytes;
+            }
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
             // gaps whole cost ~1 s per frame).
-            busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
@@ -363,6 +443,22 @@ impl Shadow {
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         to - from
     }
+}
+
+/// The parts of `[from, to)` outside every range in `ranges`, in order.
+fn outside(from: usize, to: usize, mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let (mut at, mut parts) = (from, Vec::new());
+    for (a, e) in ranges {
+        if at < to && a > at {
+            parts.push((at, a.min(to)));
+        }
+        at = at.max(e);
+    }
+    if at < to {
+        parts.push((at, to));
+    }
+    parts
 }
 
 struct Entry {
@@ -496,4 +592,144 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Three pages of title memory on page bounds (plain heap memory, so
+    /// not write-watched: refreshes copy whole ranges) and their host
+    /// copy; `None` without a host GPU. Returns the memory's owner, the
+    /// address of the first page and the copy.
+    fn title() -> Option<(Vec<u8>, usize, Shadow)> {
+        let memory = vec![0u8; 4 * PAGE];
+        let base = (memory.as_ptr() as usize).next_multiple_of(PAGE);
+        let (buffer, data) = host()?.shared_buffer(3 * PAGE as u64)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu, base as u64, 3 * PAGE as u64);
+        Some((memory, base, shadow))
+    }
+
+    /// A write of one byte: the title's into its memory, or a shader's
+    /// into the copy.
+    fn poke(at: usize, value: u8) {
+        // SAFETY: the tests pass addresses inside the memory or the copy.
+        unsafe { (at as *mut u8).write_volatile(value) }
+    }
+
+    fn peek(at: usize) -> u8 {
+        // SAFETY: as in `poke`.
+        unsafe { (at as *const u8).read_volatile() }
+    }
+
+    /// A range declared after ranges on both sides of it, once the snapshot
+    /// already spans it: what its refresh brought into the copy is not a
+    /// shader's write, and does not go back over what the title wrote since.
+    #[test]
+    fn a_range_between_earlier_ones_keeps_the_titles_newer_bytes() {
+        let Some((_memory, base, s)) = title() else {
+            return; // no host GPU here
+        };
+        let (a, b, c) = (base, base + PAGE, base + 2 * PAGE);
+        let copy = |at: usize| s.data as usize + (at - base);
+        // An earlier submission read the middle page; the title has written
+        // it since.
+        s.update(b, PAGE);
+        poke(b + 5, 1);
+        poke(b + 6, 3);
+        // This submission's shaders write the outer pages, then the middle
+        // one: each range refreshed, then declared.
+        for at in [a, c, b] {
+            s.update(at, PAGE);
+            s.writing(at, PAGE);
+        }
+        assert_eq!(peek(copy(b + 5)), 1, "the refresh");
+        // While the GPU runs: a shader writes two bytes, the title one.
+        poke(copy(a + 7), 9);
+        poke(copy(b + 9), 7);
+        poke(b + 5, 2);
+        for at in [a, c, b] {
+            s.copy_back(at, PAGE);
+        }
+        assert_eq!(peek(b + 5), 2, "the title's newer byte");
+        assert_eq!(peek(b + 6), 3, "the title's byte from before");
+        // What the shader wrote does go back, in either kind of range.
+        assert_eq!((peek(a + 7), peek(b + 9)), (9, 7));
+        assert!(s.before.lock().unwrap().is_none(), "the snapshot is done");
+    }
+
+    /// Two declared ranges that overlap: the first one's copy-back gives
+    /// the copy the title's bytes, which the second must not take for a
+    /// shader's and put back over what the title wrote in between.
+    #[test]
+    fn overlapping_ranges_keep_the_titles_newer_bytes() {
+        let Some((_memory, base, s)) = title() else {
+            return; // no host GPU here
+        };
+        let copy = |at: usize| s.data as usize + (at - base);
+        s.update(base, 2 * PAGE);
+        s.writing(base, PAGE);
+        s.writing(base, 2 * PAGE);
+        // While the GPU runs: a shader's byte and the title's, in one page.
+        poke(copy(base + 3), 9);
+        poke(base + 8, 1);
+        s.copy_back(base, PAGE);
+        assert_eq!((peek(base + 3), peek(base + 8)), (9, 1));
+        // The title writes its byte again before the second range's turn.
+        poke(base + 8, 2);
+        s.copy_back(base, 2 * PAGE);
+        assert_eq!(peek(base + 8), 2, "the title's newer byte");
+        assert_eq!(peek(base + 3), 9, "the shader's byte");
+    }
+}
+
+/// local: copy-back profile, logged every 5 s (scanned and changed bytes,
+/// time in compare, title reads, merge and title writes).
+mod back_profile {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    struct P {
+        since: Option<Instant>,
+        scanned: u64,
+        changed: u64,
+        calls: u64,
+        t: [Duration; 5],
+    }
+    static P: Mutex<P> = Mutex::new(P { since: None, scanned: 0, changed: 0, calls: 0, t: [Duration::ZERO; 5] });
+
+    pub(super) fn add(scanned: u64, changed: u64, t: [Duration; 5]) {
+        let mut p = P.lock().unwrap_or_else(|e| e.into_inner());
+        let since = *p.since.get_or_insert_with(Instant::now);
+        p.scanned += scanned;
+        p.changed += changed;
+        p.calls += 1;
+        for (a, b) in p.t.iter_mut().zip(t) {
+            *a += b;
+        }
+        if since.elapsed() >= Duration::from_secs(5) {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            tracing::info!(
+                calls = p.calls,
+                scanned_mb = p.scanned as f64 / 1048576.0,
+                changed_mb = p.changed as f64 * 64.0 / 1024.0,
+                total_ms = ms(p.t[0]),
+                compare_ms = ms(p.t[1]),
+                read_and_watch_ms = ms(p.t[2]),
+                merge_ms = ms(p.t[3]),
+                write_ms = ms(p.t[4]),
+                "copy-back profile (5 s)"
+            );
+            *p = P { since: Some(Instant::now()), scanned: 0, changed: 0, calls: 0, t: [Duration::ZERO; 5] };
+        }
+    }
+}
+
+/// local: whether the gaps around busy ranges are asked of write-watch in
+/// one call (`VICTORY_WATCH_GROUP=0` asks per gap, as before), for A/B.
+fn grouped_watch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_WATCH_GROUP").map_or(true, |v| v != "0"))
 }

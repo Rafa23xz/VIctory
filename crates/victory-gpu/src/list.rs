@@ -446,6 +446,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if crate::resource::skip_mixed_packed_copy("CopyResource", to, from) {
+                return;
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -476,6 +479,84 @@ pub(crate) struct CopyLocation {
     resource: This,
     kind: u32,
     footprint: crate::resource::PlacedFootprint,
+}
+
+/// Stages a buffer-to-texture `CopyTextureRegion` source into an upload buffer
+/// filled at submission. When the destination was widened from a packed 16-bit
+/// format to `R8G8B8A8_UNORM` on this GPU, the upload footprint is widened and
+/// the texels are expanded on the CPU at submission.
+#[cfg(windows)]
+fn prepare_footprint_upload(
+    list: &crate::host::HostList,
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    src: CopyLocation,
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    CopyLocation,
+    u64,
+)> {
+    use windows::core::Interface;
+    let host = crate::host::host()?;
+    let bytes = src.footprint.bytes()?;
+    let data = buffer_range(src.resource, src.footprint.offset, bytes)?;
+    // SAFETY: a live host resource.
+    let dst_fmt = unsafe { to.GetDesc() }.Format.0 as u32;
+    let src_fmt = crate::resource::pc_format(src.footprint.format);
+    let mut from = src;
+    if dst_fmt == crate::resource::RGBA8_UNORM && crate::resource::PACKED_16.contains(&src_fmt) {
+        if src.footprint.width == 0 || src.footprint.height == 0 || src.footprint.depth == 0 {
+            return None;
+        }
+        if u64::from(src.footprint.row_pitch) < u64::from(src.footprint.width) * 2 {
+            tracing::warn!(
+                footprint = ?src.footprint,
+                "packed 16-bit copy footprint row pitch is smaller than a row"
+            );
+            return None;
+        }
+        let row_pitch = u64::from(src.footprint.width)
+            .checked_mul(4)?
+            .next_multiple_of(256);
+        let widened = crate::resource::PlacedFootprint {
+            offset: 0,
+            format: crate::resource::RGBA8_UNORM,
+            row_pitch: u32::try_from(row_pitch).ok()?,
+            ..src.footprint
+        };
+        let dst_bytes = widened.bytes()?;
+        let lines =
+            usize::try_from(u64::from(src.footprint.height) * u64::from(src.footprint.depth))
+                .ok()?;
+        let (src_len, dst_len) = (
+            usize::try_from(bytes).ok()?,
+            usize::try_from(dst_bytes).ok()?,
+        );
+        let (buffer, staging) = list.upload(host, dst_bytes)?;
+        let (width, src_pitch, dst_pitch) = (
+            src.footprint.width as usize,
+            src.footprint.row_pitch as usize,
+            widened.row_pitch as usize,
+        );
+        let (src_at, dst_at) = (data as usize, staging as usize);
+        list.defer_host(move || {
+            let mut packed = vec![0u8; src_len];
+            crate::host::copy_mapped(packed.as_mut_ptr(), src_at as *const u8, src_len, false);
+            // SAFETY: `staging` is the persistent mapping of `buffer`, kept
+            // alive in the list's `uploads` until the list is reset.
+            let dst = unsafe { std::slice::from_raw_parts_mut(dst_at as *mut u8, dst_len) };
+            crate::resource::expand_packed16_rows(
+                src_fmt, width, lines, &packed, src_pitch, dst, dst_pitch,
+            );
+        });
+        from.resource = buffer.as_raw().cast_const().cast();
+        from.footprint = widened;
+        return Some((buffer, from, dst_bytes));
+    }
+    let (buffer, staging) = list.upload(host, bytes)?;
+    list.defer_copy(staging, data, bytes as usize);
+    from.resource = buffer.as_raw().cast_const().cast();
+    from.footprint.offset = 0;
+    Some((buffer, from, bytes))
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
@@ -513,28 +594,25 @@ extern "system" fn copy_texture_region(
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
-            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+            let Some((buffer, staged, bytes)) = prepare_footprint_upload(list, to, src) else {
                 return;
             };
-            let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
-                return;
-            };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
-            };
-            list.defer_copy(staging, data, bytes as usize);
-            from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from = staged;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
                 read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
             }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = bytes;
             _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::resource::skip_mixed_packed_copy("CopyTextureRegion", to, texture) {
+                return;
+            }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
@@ -613,6 +691,9 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
+        if crate::resource::skip_mixed_packed_copy("ResolveSubresource", to, from) {
+            return;
+        }
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
@@ -624,6 +705,7 @@ extern "system" fn resolve(
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
+        let format = crate::resource::target_format(format);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
@@ -864,7 +946,35 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
 /// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+///
+/// local: on the host, draws and dispatches with no barrier between them
+/// may overlap, so a pass could read what the one before it has not
+/// written yet. The console's sync is where the title orders them: it
+/// becomes an unordered access barrier on every resource
+/// (`VICTORY_SYNC_BARRIER=0` restores upstream).
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("VICTORY_SYNC_BARRIER").map_or(true, |v| v.trim() != "0")) {
+            return;
+        }
+        if let Some(list) = host_list(this) {
+            static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n == 0 {
+                tracing::info!("sync: pipeline syncs become UAV barriers");
+            }
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+            // SAFETY: the same layout; no resource named.
+            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1153,8 +1263,26 @@ extern "system" fn execute_indirect(
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
+    // local: `VICTORY_INDIRECT_SKIP=all` or a comma list of argument kinds
+    // (0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch, 105 single
+    // dispatch) drops those indirect executions, to isolate host failures.
+    static SKIP: std::sync::OnceLock<Option<Vec<u32>>> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        let v = std::env::var("VICTORY_INDIRECT_SKIP").ok()?;
+        let v = v.trim();
+        if v.eq_ignore_ascii_case("all") {
+            return Some(Vec::new());
+        }
+        Some(v.split(',').filter_map(|k| k.trim().parse().ok()).collect())
+    });
+    let skipped = match (skip, args) {
+        (Some(list), _) if list.is_empty() => true,
+        (Some(list), [[kind, ..]]) => list.contains(kind),
+        _ => false,
+    };
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
+    if !skipped
+        && let ([[kind, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
     {
         const DISPATCH: u32 = 2;

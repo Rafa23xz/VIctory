@@ -163,9 +163,48 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     }
     crate::fence::signal(fence, value)
 }
-/// Nothing runs on the queue, so waiting for a fence never blocks it.
-extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+/// Upstream: nothing runs on the queue, so waiting for a fence never blocks
+/// it. local: our submissions run when the title submits them, so a queue
+/// told to wait for a fence another thread's queue signals later would run
+/// its next lists before the work they depend on (reading data never
+/// written). The calling thread now blocks until the fence is reached, at
+/// most `VICTORY_QUEUE_WAIT_MS` (default 2000; 0 restores upstream).
+extern "system" fn wait(_: This, fence: This, value: u64) -> HRESULT {
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_QUEUE_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2000)
+    });
+    static ALREADY: AtomicU64 = AtomicU64::new(0);
+    static BLOCKED: AtomicU64 = AtomicU64::new(0);
+    static TIMED_OUT: AtomicU64 = AtomicU64::new(0);
+    if crate::fence::reached(fence, value) {
+        ALREADY.fetch_add(1, Ordering::Relaxed);
+        return S_OK;
+    }
+    if limit == 0 {
+        return S_OK;
+    }
+    let started = std::time::Instant::now();
+    let ok = crate::fence::block_until(fence, value, std::time::Duration::from_millis(limit));
+    let blocked = BLOCKED.fetch_add(1, Ordering::Relaxed) + 1;
+    if !ok {
+        let n = TIMED_OUT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 20 || n % 100 == 0 {
+            tracing::warn!(value, timed_out = n, "queue wait: fence not reached in time; running on");
+        }
+    } else if blocked <= 20 || blocked % 500 == 0 {
+        tracing::info!(
+            value,
+            ms = started.elapsed().as_secs_f64() * 1000.0,
+            blocked,
+            already = ALREADY.load(Ordering::Relaxed),
+            "queue wait: blocked until another queue signalled"
+        );
+    }
+    S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
@@ -227,7 +266,6 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }

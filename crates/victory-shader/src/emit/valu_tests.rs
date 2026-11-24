@@ -136,6 +136,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        options: super::TranslateOptions::default(),
     })
     .expect("lower");
 
@@ -147,6 +148,8 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        stride_table: lowered.stride_table,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -672,4 +675,395 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
+}
+
+/// A wave64 compute program of 64 lanes (thread id in v0) with `body` between
+/// the descriptor load and the store of v0 at byte 4 * lane.
+fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
+    let mut words = Vec::new();
+    words.push(s_mov_b32(5, 0x80));
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(body);
+    // v_lshlrev_b32 v9, 2, v10 (v10 = saved thread id): byte offset per lane
+    words.push(0x3412_1482);
+    // buffer_store_dword v0, v9, s[8:11], 0 offen
+    words.extend_from_slice(&[
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | (8 >> 2) << 16 | 9,
+    ]);
+    words.push(S_ENDPGM);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [64, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).map_err(|e| format!("{e:?}"))?;
+    let res = resource::track(&p, &native.layout, native.stage).map_err(|e| format!("{e:?}"))?;
+    let io = io::raise(&p, &native).map_err(|e| format!("{e:?}"))?;
+    let st = structure::structure(&p).map_err(|e| format!("{e:?}"))?;
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        options: super::TranslateOptions::default(),
+    })
+    .map_err(|e| format!("{e:?}"))?;
+    Ok(HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        stride_table: lowered.stride_table,
+    })
+}
+
+/// A divergent loop's exit mask (lanes that left in earlier iterations, so
+/// not running where it is last written) read as a number after the loop.
+#[test]
+fn loop_exit_mask_counted_after_the_loop() {
+    let body = [
+        0x7E14_0300, // v_mov_b32 v10, v0 (thread id kept)
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
+        0xBE82_0480, // s_mov_b64 s[2:3], 0
+        0x4E02_0281, // loop: v_subrev_nc_u32 v1, 1, v1 (v1 - 1)
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+        0xBF89_FFFB, // s_cbranch_execnz loop
+        0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+        0xBE84_1002, // s_bcnt1_i32_b64 s4, s[2:3]
+        0x7E00_0204, // v_mov_b32 v0, s4
+    ];
+    let shader = build_lanes_cs(&body).unwrap_or_else(|e| panic!("translation: {e}"));
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    let got: Vec<u32> = out[0][..64].to_vec();
+    assert!(
+        got.iter().all(|&x| x == 64),
+        "lanes counted as exited: {got:?}"
+    );
+}
+
+/// A scalar counter a divergent loop adds to in every iteration, read after
+/// the loop: the console runs the loop until its last lane leaves, so every
+/// lane reads the count of the wave's iterations.
+#[test]
+fn scalar_counted_in_a_divergent_loop_read_after_it() {
+    let body = [
+        0x7E14_0300, // v_mov_b32 v10, v0 (thread id kept)
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
+        0xBE82_0480, // s_mov_b64 s[2:3], 0
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0x8106_8106, // loop: s_add_u32 s6, s6, 1
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1 (v1 - 1)
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+        0xBF89_FFFA, // s_cbranch_execnz loop
+        0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+        0x7E00_0206, // v_mov_b32 v0, s6
+    ];
+    let shader = build_lanes_cs(&body).unwrap_or_else(|e| panic!("translation: {e}"));
+    let host = Host::new(false).unwrap();
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    let got: Vec<u32> = out[0][..64].to_vec();
+    assert!(got.iter().all(|&x| x == 64), "iterations counted: {got:?}");
+}
+
+/// A lane mask holding lanes from before a divergent branch and lanes added
+/// inside it, counted after the branch.
+#[test]
+fn mask_grown_inside_a_branch_counted_after_it() {
+    let body = [
+        0x7E14_0300, // v_mov_b32 v10, v0
+        0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0      (lanes 0-15)
+        0xBE82_046A, // s_mov_b64 s[2:3], vcc
+        0x7D86_00A0, // v_cmp_le_u32 vcc, 32, v0      (lanes 32-63)
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        0xBF88_0002, // s_cbranch_execz -> join
+        0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0      (of those: 32-47)
+        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x88FE_047E, // join: s_or_b64 exec, exec, s[4:5]
+        0xBE86_1002, // s_bcnt1_i32_b64 s6, s[2:3]
+        0x7E00_0206, // v_mov_b32 v0, s6
+    ];
+    let shader = build_lanes_cs(&body).unwrap_or_else(|e| panic!("translation: {e}"));
+    let host = Host::new(false).unwrap();
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    let got: Vec<u32> = out[0][..64].to_vec();
+    assert!(got.iter().all(|&x| x == 32), "lanes counted: {got:?}");
+}
+
+/// Nested divergent loops with a scalar counter in the inner one: the wave
+/// runs 4 outer iterations, and in each the inner loop runs until its
+/// longest lane (4 iterations) is done, so every lane reads 16.
+#[test]
+fn scalar_counted_in_nested_divergent_loops() {
+    let body = [
+        0x7E14_0300, // v_mov_b32 v10, v0
+        0x3602_0083, // v_and_b32 v1, 3, v0          outer count - 1
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0x2C08_0084, // v_lshrrev_b32 v4, 4, v0      inner count - 1
+        0x4A08_0881, // v_add_nc_u32 v4, 1, v4
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0xBE82_0480, // s_mov_b64 s[2:3], 0
+        0xBE8C_0480, // outer: s_mov_b64 s[12:13], 0
+        0x7E06_0304, // v_mov_b32 v3, v4
+        0x8106_8106, // inner: s_add_i32 s6, s6, 1
+        0x4E06_0681, // v_subrev_nc_u32 v3, 1, v3
+        0x7D84_0680, // v_cmp_eq_u32 vcc, 0, v3
+        0x888C_0C6A, // s_or_b64 s[12:13], vcc, s[12:13]
+        0x8AFE_0C7E, // s_andn2_b64 exec, exec, s[12:13]
+        0xBF89_FFFA, // s_cbranch_execnz inner
+        0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+        0xBF89_FFF2, // s_cbranch_execnz outer
+        0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+        0x7E00_0206, // v_mov_b32 v0, s6
+    ];
+    let shader = build_lanes_cs(&body).unwrap_or_else(|e| panic!("translation: {e}"));
+    let host = Host::new(false).unwrap();
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    let got: Vec<u32> = out[0][..64].to_vec();
+    assert!(
+        got.iter().all(|&x| x == 16),
+        "inner iterations counted: {got:?}"
+    );
+}
+
+/// local: a synthetic compute program whose parameters all lie past the 16
+/// user SGPRs: it reads them from the table `s[0:1]` points at, and writes
+/// through a root UAV. The host has them as root parameters: constants in
+/// the user data, the UAV as a root view. Lanes below the count (constant
+/// dword 0) write the value (dword 1), 4 bytes each.
+#[test]
+fn spilled_user_data_fill_a_root_uav() {
+    let words: &[u32] = &[
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0x8703_FF01,
+        0x0000_FFFF, // s_and_b32 s3, s1, 0xffff
+        0xF404_0101,
+        0xFA00_0008, // s_load_dwordx2 s[4:5], s[2:3], 0x8 (user data 18, 19)
+        0xF408_0201,
+        0xFA00_0010, // s_load_dwordx4 s[8:11], s[2:3], 0x10 (user data 20..23)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7DA8_0008, // v_cmpx_gt_u32 exec_lo, s8, v0
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x7E02_0209, // v_mov_b32 v1, s9
+        0xBE86_03C1, // s_mov_b32 s6, -1
+        0xBE87_03FF,
+        0x1101_4FAC, // s_mov_b32 s7, 0x11014fac (32-bit data, xyzw)
+        0xBE85_1D90, // s_bitset1_b32 s5, 16
+        0xE070_1000,
+        0x8001_0104, // buffer_store_dword v1, v4, s[4:7], 0 offen
+        S_ENDPGM,
+    ];
+    let param = |root, sgprs, user_data, slot| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            param(RootType::Descriptor, 2, 16, 0),
+            param(RootType::Descriptor, 2, 18, 1),
+            param(RootType::Constants, 16, 20, 2),
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 1,
+            dwords: 4,
+            user_data: 18,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1, // 2 user SGPRs: the spill table's address
+            threads: [32, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    assert_eq!(res.user_loads.len(), 2);
+    let io = io::raise(&p, &native).expect("io::raise");
+    let st = structure::structure(&p).expect("structure");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        options: super::TranslateOptions::default(),
+    })
+    .expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        stride_table: lowered.stride_table,
+    };
+    assert_eq!(shader.root_uavs, [1], "the UAV is root parameter 1's view");
+    assert!(shader.root_srvs.is_empty() && shader.root_cbvs.is_empty());
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let (count, value) = (20u32, 0xC0FF_EE01u32);
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot, u.dword) {
+                (RootType::Constants, 2, 0) => count,
+                (RootType::Constants, 2, 1) => value,
+                (RootType::Constants, 2, _) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud)), (1, Root::Uav(128))],
+                    views: &[],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let want: Vec<u32> = (0..128).map(|i| if i < count { value } else { 0 }).collect();
+        assert_eq!(out[0], want, "{label}");
+        ran += 1;
+    }
+    if ran == 0 {
+        eprintln!("no host ran the fill");
+    }
 }

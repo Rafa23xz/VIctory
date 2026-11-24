@@ -11,15 +11,47 @@
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, TranslateOptions, UserData, Wave64Mode};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+static WAVE64_MODE: AtomicU8 = AtomicU8::new(0);
+
+fn mode_byte(mode: Wave64Mode) -> u8 {
+    match mode {
+        Wave64Mode::Native => 0,
+        Wave64Mode::Wave32 => 1,
+        Wave64Mode::Emulate => 2,
+    }
+}
+
+/// Records the host device's preferred Wave64 compute lowering strategy.
+#[cfg(windows)]
+pub(crate) fn set_wave64_mode(mode: Wave64Mode) {
+    WAVE64_MODE.store(mode_byte(mode), Ordering::Relaxed);
+}
+
+fn effective_wave64_mode() -> Wave64Mode {
+    if let Ok(v) = std::env::var("VICTORY_WAVE64_EMULATE") {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "0" | "native" => return Wave64Mode::Native,
+            "wave32" | "32" => return Wave64Mode::Wave32,
+            "1" | "emulate" | "force" => return Wave64Mode::Emulate,
+            "" | "auto" => {}
+            other => tracing::warn!(value = other, "unknown VICTORY_WAVE64_EMULATE; using auto"),
+        }
+    }
+    match WAVE64_MODE.load(Ordering::Relaxed) {
+        1 => Wave64Mode::Wave32,
+        2 => Wave64Mode::Emulate,
+        _ => Wave64Mode::Native,
+    }
+}
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
@@ -67,18 +99,52 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// local: `VICTORY_LOOP_LIMITS` = `hash:limit,...` (16-digit shader hashes
+/// as logged): those shaders' loops stop after `limit` iterations per lane
+/// (a world compute program whose loop ran to the 2^20 limit in thousands of
+/// groups every frame took most of the GPU time per frame). Unset: none.
+fn own_loop_limit(container: &[u8]) -> Option<u32> {
+    static LIMITS: OnceLock<Vec<(String, u32)>> = OnceLock::new();
+    let limits = LIMITS.get_or_init(|| {
+        let value = std::env::var("VICTORY_LOOP_LIMITS").unwrap_or_default();
+        value
+            .split(',')
+            .filter_map(|p| {
+                let (h, l) = p.trim().split_once(':')?;
+                Some((h.trim().to_ascii_lowercase(), l.trim().parse().ok()?))
+            })
+            .collect()
+    });
+    if limits.is_empty() {
+        return None;
+    }
+    let hash = blake3::hash(container).to_hex();
+    limits.iter().find(|(h, _)| hash.starts_with(h.as_str())).map(|&(_, l)| l)
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let wave64 = effective_wave64_mode();
+    let options = TranslateOptions { wave64 };
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    // local: shaders whose loops spin to the limit every frame get a low
+    // one of their own (translated outside the cache, which keys on the
+    // global limit only).
+    if let Some(limit) = own_loop_limit(container) {
+        let hash = &blake3::hash(container).to_hex()[..16];
+        tracing::info!(hash, limit, "shader translated with its own loop limit");
+        return victory_shader::emit::with_loop_limit(limit, || translate(container));
+    }
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, build(), wave64, container, translate),
         None => translate(container),
     }
 }
 
-/// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// The cache entry's converter: the build, the lowering mode and the
+/// container in, the encoded translation out. `ran` tells a miss from a hit.
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
@@ -94,7 +160,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        let shader = (self.translate)(&input[33..]).map_err(anyhow::Error::msg)?;
         Ok(encode(&shader))
     }
 }
@@ -102,10 +168,12 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
+    mode: Wave64Mode,
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
+    let mb = [mode_byte(mode)];
+    let input = [&build[..], &mb[..], container].concat();
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
@@ -131,7 +199,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -206,10 +274,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs] {
+    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, u32::from(s.stride_table));
     out
 }
 
@@ -266,6 +335,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let root_uavs = r.list()?;
+    let stride_table = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -274,6 +345,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        root_uavs,
+        stride_table,
     })
 }
 
@@ -300,6 +373,8 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            root_uavs: vec![5],
+            stride_table: true,
         }
     }
 
@@ -314,26 +389,48 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(
+            cached(&cache, &build, Wave64Mode::Native, container, translate),
+            Ok(shader())
+        );
+        assert_eq!(
+            cached(&cache, &build, Wave64Mode::Native, container, translate),
+            Ok(shader())
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
-        // Another build translates again.
-        assert_eq!(cached(&cache, &[8; 32], container, translate), Ok(shader()));
+        // Another Wave64 mode translates separately.
+        assert_eq!(
+            cached(&cache, &build, Wave64Mode::Wave32, container, translate),
+            Ok(shader())
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 2);
+
+        // Another build translates again.
+        assert_eq!(
+            cached(&cache, &[8; 32], Wave64Mode::Native, container, translate),
+            Ok(shader())
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH1 broken").unwrap();
         }
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
-        assert_eq!(runs.load(Ordering::Relaxed), 3);
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
-        assert_eq!(runs.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            cached(&cache, &build, Wave64Mode::Native, container, translate),
+            Ok(shader())
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            cached(&cache, &build, Wave64Mode::Native, container, translate),
+            Ok(shader())
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 4);
 
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
-        assert!(cached(&cache, &build, b"other", fail).is_err());
+        assert!(cached(&cache, &build, Wave64Mode::Native, b"other", fail).is_err());
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
